@@ -142,19 +142,27 @@ def bpe_pre_tokenize(file_path: str | os.PathLike, special_tokens: list[str], nu
     return master_counter
 
 # Convert pre-tokens to list-of-bytes, and keep track of counts
-def bpe_pre_token_bytes_seqs_with_counts(pre_tokens: Counter[bytes, int]) -> tuple[dict[tuple[bytes, ...], int], dict[tuple[bytes, bytes], int]]:
-    # Convert pre-tokens to list-of-bytes
-    pre_bytes_seqs_with_counts: dict[tuple[bytes, ...], int] = {}
+def bpe_pre_token_bytes_seqs_with_counts(pre_tokens: Counter[bytes, int]) -> tuple[dict[tuple[bytes, bytes], int], dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]]]:
     # Use defaultdict so bpe_merge_v2 can do incremental updates without re-wrapping
     bytes_pair_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
+    # inverted mapping: from byte pairs to their byte sequences with counts
+    # one seq can have duplicate pairs
+    bytes_pairs_to_seq: dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]] = defaultdict(dict)
+    
     for byte_list, count in pre_tokens.items():
         byte_seqs = [bytes([x]) for x in byte_list]
         seq_key = tuple(byte_seqs)
-        pre_bytes_seqs_with_counts[seq_key] = pre_bytes_seqs_with_counts.get(seq_key, 0) + count
+        pair_set = set() # avoid counting the same pair multiple times in the same sequence
         for i in range(1, len(byte_seqs)):
             pair_key = (byte_seqs[i - 1], byte_seqs[i])
             bytes_pair_counts[pair_key] += count
-    return pre_bytes_seqs_with_counts, bytes_pair_counts
+            pair_set.add(pair_key)
+        
+        # seq_key is unique -> (pair, seq_key) is unique -> so we can safely assign the count
+        for pair in pair_set:
+            bytes_pairs_to_seq[pair][seq_key] = count
+
+    return bytes_pair_counts, bytes_pairs_to_seq
 
 def bpe_find_max_freq(bytes_pair_counts: dict[tuple[bytes, bytes], int]) -> tuple[tuple[bytes, bytes] | None, int | None]:
     if not bytes_pair_counts:
@@ -162,22 +170,13 @@ def bpe_find_max_freq(bytes_pair_counts: dict[tuple[bytes, bytes], int]) -> tupl
     max_count, max_pair = max((c, p) for p, c in bytes_pair_counts.items())
     return max_pair, max_count
 
-def bpe_merge(pre_bytes_seqs_with_counts: dict[tuple[bytes, ...], int], max_pair: tuple[bytes, bytes], counts: dict[tuple[bytes, bytes], int]) -> tuple[dict[tuple[bytes, ...], int], dict[tuple[bytes, bytes], int]]:
-    # Merge the max pair in the pre_bytes_seqs
-    # `counts` must be a defaultdict(int) (seeded in bpe_pre_token_bytes_seqs_with_counts)
-    # so missing keys auto-init to 0 when merging creates brand-new pairs.
-    merged = defaultdict(int)
+def bpe_merge(bytes_pairs_to_seq: dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]], max_pair: tuple[bytes, bytes], counts: dict[tuple[bytes, bytes], int]) -> tuple[dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]], dict[tuple[bytes, bytes], int]]:
+    # Merge the max pair in the bytes_seqs, update both bytes_pairs_to_seq and counts
     max_first, max_second = max_pair
-    for byte_seq_tuple, seq_count in pre_bytes_seqs_with_counts.items():
+    max_pair_seqs = list(bytes_pairs_to_seq[max_pair].items())
+    
+    for byte_seq_tuple, seq_count in max_pair_seqs:
         seq_len = len(byte_seq_tuple)
-        
-        if seq_len < 2:
-            continue
-
-        if max_first not in byte_seq_tuple or max_second not in byte_seq_tuple:
-            merged[byte_seq_tuple] += seq_count
-            continue
-
         # Tuples support indexing — no need to copy to a list.
         i = 0
         updated_byte_seq = []
@@ -191,21 +190,29 @@ def bpe_merge(pre_bytes_seqs_with_counts: dict[tuple[bytes, ...], int], max_pair
                 i += 1
         if i < seq_len:
             append(byte_seq_tuple[i])
-        merged[tuple(updated_byte_seq)] += seq_count
 
-        # Subtract old pairs (they no longer exist in the updated sequence)
-        for i in range(seq_len - 1):
-            key = (byte_seq_tuple[i], byte_seq_tuple[i + 1])
-            counts[key] -= seq_count
-            if counts[key] <= 0:
-                del counts[key]
-        # Add new pairs (some may be brand-new pairs created by the merge)
-        update_seq_len = len(updated_byte_seq)
-        for i in range(update_seq_len - 1):
-            counts[(updated_byte_seq[i], updated_byte_seq[i + 1])] += seq_count
+        updated_seq_len = len(updated_byte_seq)
+        updated_byte_seq_tuple = tuple(updated_byte_seq)
+
+        # reducing the count for impacted pairs from the original sequence
+        # delete the pairs to seq mapping for the original sequence
+        for i in range(1, seq_len):
+            pair = (byte_seq_tuple[i - 1], byte_seq_tuple[i])
+            counts[pair] -= seq_count
+            if counts[pair] <= 0:
+                del counts[pair]
+            if byte_seq_tuple in bytes_pairs_to_seq[pair]:
+                del bytes_pairs_to_seq[pair][byte_seq_tuple]
+
+        # add the count for the new sequence
+        # add the new pairs to the bytes_pairs_to_seq mapping
+        for i in range(1, updated_seq_len):
+            pair = (updated_byte_seq[i - 1], updated_byte_seq[i])
+            counts[pair] += seq_count
+            bytes_pairs_to_seq[pair][updated_byte_seq_tuple] = seq_count
     
     # Return counts as-is (defaultdict is a dict subclass) so callers can keep using it incrementally.
-    return dict(merged), counts
+    return bytes_pairs_to_seq, counts
 
 def bpe_train(
     input_path: str | os.PathLike,
@@ -237,7 +244,7 @@ def bpe_train(
     vocab = bpe_vocab_init(vocab_size, special_tokens)
     merges = []
     pre_tokens = bpe_pre_tokenize(input_path, special_tokens, num_workers)
-    pre_bytes_seqs_with_counts, bytes_pair_counts = bpe_pre_token_bytes_seqs_with_counts(pre_tokens)
+    bytes_pair_counts, bytes_pairs_to_seq = bpe_pre_token_bytes_seqs_with_counts(pre_tokens)
     for i in range(vocab_size - len(vocab)):
         max_pair, max_count = bpe_find_max_freq(bytes_pair_counts)
         if max_pair is None:
@@ -245,5 +252,5 @@ def bpe_train(
         #print(f"Merge {i + 1}: {max_pair} (count: {max_count})")
         bpe_update_vocab(vocab, max_pair[0] + max_pair[1])
         merges.append(max_pair)
-        pre_bytes_seqs_with_counts, bytes_pair_counts = bpe_merge(pre_bytes_seqs_with_counts, max_pair, bytes_pair_counts)
+        bytes_pairs_to_seq, bytes_pair_counts = bpe_merge(bytes_pairs_to_seq, max_pair, bytes_pair_counts)
     return vocab, merges
