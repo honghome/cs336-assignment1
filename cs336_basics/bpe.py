@@ -1,6 +1,7 @@
 from multiprocessing import Pool
 import os
 import re
+import threading
 from typing import BinaryIO
 from collections import Counter, defaultdict
 
@@ -9,7 +10,35 @@ try:
 except ImportError:
     regex_re = None
 
+import heapq
 
+class _PairHeapEntry:
+    """A snapshot of a pair's count, used as an element in a max-heap.
+
+    Heap ordering rules (so heapq's min-heap behaves as a max-heap with BPE tie-break):
+      1. Higher count wins.
+      2. On equal counts, lexicographically LARGER pair wins (BPE rule).
+
+    Entries are immutable snapshots — when a pair's count changes, push a NEW
+    entry instead of mutating an existing one. Stale entries are filtered out
+    at pop time by comparing `count` against the authoritative pair_to_count dict.
+    """
+    __slots__ = ('count', 'pair')
+
+    def __init__(self, count: int, pair: tuple[bytes, bytes]):
+        self.count = count
+        self.pair = pair
+
+    def __lt__(self, other: '_PairHeapEntry') -> bool:
+        # heapq is a min-heap, so "smaller" means "comes out first".
+        # We want the max count first, and on ties the larger pair first.
+        if self.count != other.count:
+            return self.count > other.count   # invert: higher count → "smaller" in heap
+        return self.pair > other.pair         # invert: larger pair → "smaller" in heap
+
+    def __repr__(self) -> str:
+        return f"_PairHeapEntry(count={self.count}, pair={self.pair})"
+    
 def find_chunk_boundaries(
     file_path: str | os.PathLike,
     desired_num_chunks: int,
@@ -101,16 +130,11 @@ def _tokenize_chunk_and_count(chunk_boundary: tuple[int, int]) -> Counter[bytes,
         )
 
     for segment in segments:
-        if not segment:
-            continue
-        if segment in _worker_special_tokens:
-            # token_counts[segment.encode('utf-8')] += 1
-            continue
-        # Tokenize the segment and count the tokens
-        for m in regex_re.finditer(_worker_pat, segment):
-            token_counts[m.group(0).encode('utf-8')] += 1
+        if segment and segment not in _worker_special_tokens:
+            # Tokenize the segment and count the tokens
+            token_counts.update(regex_re.findall(_worker_pat, segment))
     
-    return token_counts
+    return Counter({s.encode('utf-8'): c for s, c in token_counts.items()})
 
 def bpe_pre_tokenize(file_path: str | os.PathLike, special_tokens: list[str], num_workers: int) -> Counter[bytes, int]:
     assert num_workers > 0, "Number of workers must be positive"
@@ -126,23 +150,38 @@ def bpe_pre_tokenize(file_path: str | os.PathLike, special_tokens: list[str], nu
         _init_worker(special_tokens, PAT, file_path)
         return _tokenize_chunk_and_count((0, boundaries[-1]))
 
-    # Use imap_unordered for lazy evaluation and better memory performance
-    with Pool(processes=num_workers, initializer=_init_worker, initargs=(special_tokens, PAT, file_path)) as pool:
-        
+    # Manually manage the pool lifecycle. On Windows, BOTH `pool.terminate()`
+    # (used by `with Pool(...)` on exit) and `pool.close()+pool.join()` block
+    # ~150 seconds inside Pool's internal thread cleanup. Since all useful
+    # work is finished by the time we exit the for-loop, we hand cleanup off
+    # to a daemon thread so the OS reaps the workers in the background while
+    # this function returns immediately.
+    pool = Pool(processes=num_workers, initializer=_init_worker, initargs=(special_tokens, PAT, file_path))
+    try:
         master_counter = Counter()
-        
+
         # Process chunks lazily and aggregate results as they complete
         results_iterator = pool.imap_unordered(_tokenize_chunk_and_count, chunk_boundaries)
-        
+
         print("Starting token counting across all chunks...")
         for i, chunk_counter in enumerate(results_iterator):
             master_counter.update(chunk_counter)
             print(f"Processed chunk {i + 1}/{len(chunk_boundaries)}...")
-            
+    except BaseException:
+        pool.terminate()
+        pool.join()
+        raise
+
+    # Fire-and-forget cleanup: workers are idle, daemon thread waits for them.
+    def _cleanup(p):
+        p.close()
+        p.join()
+    threading.Thread(target=_cleanup, args=(pool,), daemon=True).start()
+
     return master_counter
 
 # Convert pre-tokens to list-of-bytes, and keep track of counts
-def bpe_pre_token_bytes_seqs_with_counts(pre_tokens: Counter[bytes, int]) -> tuple[dict[tuple[bytes, bytes], int], dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]]]:
+def bpe_pre_token_bytes_seqs_with_counts(pre_tokens: Counter[bytes, int]) -> tuple[dict[tuple[bytes, bytes], int], dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]], list[_PairHeapEntry]]:
     # Use defaultdict so bpe_merge_v2 can do incremental updates without re-wrapping
     bytes_pair_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
     # inverted mapping: from byte pairs to their byte sequences with counts
@@ -162,15 +201,28 @@ def bpe_pre_token_bytes_seqs_with_counts(pre_tokens: Counter[bytes, int]) -> tup
         for pair in pair_set:
             bytes_pairs_to_seq[pair][seq_key] = count
 
-    return bytes_pair_counts, bytes_pairs_to_seq
+    # create a max-heap of the most frequent pairs
+    max_pair_heap = [_PairHeapEntry(c, p) for p, c in bytes_pair_counts.items()]
+    heapq.heapify(max_pair_heap)
+
+    return bytes_pair_counts, bytes_pairs_to_seq, max_pair_heap
 
 def bpe_find_max_freq(bytes_pair_counts: dict[tuple[bytes, bytes], int]) -> tuple[tuple[bytes, bytes] | None, int | None]:
     if not bytes_pair_counts:
+        print("No pairs found.")
         return None, None
     max_count, max_pair = max((c, p) for p, c in bytes_pair_counts.items())
     return max_pair, max_count
 
-def bpe_merge(bytes_pairs_to_seq: dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]], max_pair: tuple[bytes, bytes], counts: dict[tuple[bytes, bytes], int]) -> tuple[dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]], dict[tuple[bytes, bytes], int]]:
+def bpe_find_max_freq_from_heap(counts: dict[tuple[bytes, bytes], int], max_pair_heap: list[_PairHeapEntry]) -> tuple[tuple[bytes, bytes] | None, int | None]:
+    # Filter out stale entries
+    while max_pair_heap:
+        max_pair_entry = heapq.heappop(max_pair_heap)
+        if max_pair_entry.count == counts.get(max_pair_entry.pair, 0):
+            return max_pair_entry.pair, max_pair_entry.count
+    return None, None
+
+def bpe_merge(bytes_pairs_to_seq: dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]], max_pair: tuple[bytes, bytes], counts: dict[tuple[bytes, bytes], int], max_pair_heap: list[_PairHeapEntry]) -> tuple[dict[tuple[bytes, bytes], dict[tuple[bytes, ...], int]], dict[tuple[bytes, bytes], int], list[_PairHeapEntry]]:
     # Merge the max pair in the bytes_seqs, update both bytes_pairs_to_seq and counts
     max_first, max_second = max_pair
     max_pair_seqs = list(bytes_pairs_to_seq[max_pair].items())
@@ -201,6 +253,8 @@ def bpe_merge(bytes_pairs_to_seq: dict[tuple[bytes, bytes], dict[tuple[bytes, ..
             counts[pair] -= seq_count
             if counts[pair] <= 0:
                 del counts[pair]
+            else:
+                heapq.heappush(max_pair_heap, _PairHeapEntry(counts[pair], pair))
             if byte_seq_tuple in bytes_pairs_to_seq[pair]:
                 del bytes_pairs_to_seq[pair][byte_seq_tuple]
 
@@ -209,10 +263,11 @@ def bpe_merge(bytes_pairs_to_seq: dict[tuple[bytes, bytes], dict[tuple[bytes, ..
         for i in range(1, updated_seq_len):
             pair = (updated_byte_seq[i - 1], updated_byte_seq[i])
             counts[pair] += seq_count
+            heapq.heappush(max_pair_heap, _PairHeapEntry(counts[pair], pair))
             bytes_pairs_to_seq[pair][updated_byte_seq_tuple] = seq_count
-    
+
     # Return counts as-is (defaultdict is a dict subclass) so callers can keep using it incrementally.
-    return bytes_pairs_to_seq, counts
+    return bytes_pairs_to_seq, counts, max_pair_heap
 
 def bpe_train(
     input_path: str | os.PathLike,
@@ -243,14 +298,23 @@ def bpe_train(
     """
     vocab = bpe_vocab_init(vocab_size, special_tokens)
     merges = []
+    import time as _t
+    _start = _t.perf_counter()
     pre_tokens = bpe_pre_tokenize(input_path, special_tokens, num_workers)
-    bytes_pair_counts, bytes_pairs_to_seq = bpe_pre_token_bytes_seqs_with_counts(pre_tokens)
+    _t1 = _t.perf_counter()
+    print(f"[TIMING] bpe_pre_tokenize: {_t1 - _start:.2f}s")
+    bytes_pair_counts, bytes_pairs_to_seq, max_pair_heap = bpe_pre_token_bytes_seqs_with_counts(pre_tokens)
+    _t2 = _t.perf_counter()
+    print(f"[TIMING] bpe_pre_token_bytes_seqs_with_counts: {_t2 - _t1:.2f}s")
     for i in range(vocab_size - len(vocab)):
-        max_pair, max_count = bpe_find_max_freq(bytes_pair_counts)
+        max_pair, max_count = bpe_find_max_freq_from_heap(bytes_pair_counts, max_pair_heap)
         if max_pair is None:
             break
-        #print(f"Merge {i + 1}: {max_pair} (count: {max_count})")
+        #if i % 100 == 0:
+        #    print(f"Merge {i + 1}: {max_pair} (count: {max_count})")
         bpe_update_vocab(vocab, max_pair[0] + max_pair[1])
         merges.append(max_pair)
-        bytes_pairs_to_seq, bytes_pair_counts = bpe_merge(bytes_pairs_to_seq, max_pair, bytes_pair_counts)
+        bpe_merge(bytes_pairs_to_seq, max_pair, bytes_pair_counts, max_pair_heap)
+    _t3 = _t.perf_counter()
+    print(f"[TIMING] merge loop ({len(merges)} merges): {_t3 - _t2:.2f}s")
     return vocab, merges
