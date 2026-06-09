@@ -310,8 +310,10 @@ def bpe_train(
         max_pair, max_count = bpe_find_max_freq_from_heap(bytes_pair_counts, max_pair_heap)
         if max_pair is None:
             break
-        #if i % 100 == 0:
-        #    print(f"Merge {i + 1}: {max_pair} (count: {max_count})")
+        
+        if i % 100 == 0:
+            print(f"Merge {i + 1}: {max_pair} (count: {max_count})")
+        
         bpe_update_vocab(vocab, max_pair[0] + max_pair[1])
         merges.append(max_pair)
         bpe_merge(bytes_pairs_to_seq, max_pair, bytes_pair_counts, max_pair_heap)
