@@ -130,6 +130,167 @@
 
 ---
 
+# BPE Tokenizer (Concepts)
+
+How byte-level BPE is defined and *why* it is defined that way. The performance
+sections below are about how to implement it fast; this section is about what the
+algorithm actually does and the design choices behind it.
+
+## 1. What BPE Produces
+
+Training a BPE tokenizer produces two artifacts:
+
+- **`vocab: dict[int, bytes]`** — a mapping from integer token ID to the raw bytes
+  that token represents. The vocab always starts with:
+  - **256 single-byte tokens** for byte values `0x00..0xFF` (ensures *every* byte
+    sequence is encodable — no out-of-vocabulary at the byte level).
+  - **Special tokens** like `<|endoftext|>` (added explicitly; never produced by
+    merges).
+  - **Merged tokens** — one new token per merge.
+- **`merges: list[tuple[bytes, bytes]]`** — an *ordered* list of byte-pair merges,
+  in the order they were learned. The order *is* the priority.
+
+The relationship is exact:
+
+```
+len(vocab) = 256 + |special_tokens| + len(merges)
+```
+
+So for OpenWebText with `vocab_size=32000` and one special token,
+`len(merges) = 32000 - 256 - 1 = 31743`.
+
+## 2. Training (Conceptual)
+
+1. **Pre-tokenize** the corpus into "pre-tokens" (e.g. with the GPT regex). Each
+   pre-token is converted into a sequence of single-byte tokens.
+2. **Count adjacent byte pairs** across all pre-tokens (weighted by pre-token
+   frequency).
+3. **Pick the most frequent pair**, append it to `merges`, and add it as a new
+   token in `vocab`.
+4. **Apply that merge everywhere** — every adjacent occurrence of the pair becomes
+   the new token. Update pair counts incrementally.
+5. **Repeat** until `len(vocab) == vocab_size`.
+
+The merges list is therefore "most frequent first," roughly. Each merge created
+during training reflects a pattern that was statistically common in the corpus.
+
+## 3. Encoding (Inference): Priority-Ordered Merges
+
+Given a new pre-token, BPE encoding is **not** "find the longest matching vocab
+token" and **not** "minimize total token count." It is:
+
+> Repeatedly find the **lowest-indexed merge** (highest priority) that applies to
+> any adjacent pair in the current symbol sequence, and apply it. Stop when no
+> merge applies.
+
+Pseudocode:
+
+```python
+def encode_pretoken(pre_token_bytes, merge_rank):
+    symbols = [bytes([b]) for b in pre_token_bytes]
+    while True:
+        best_rank, best_idx = None, -1
+        for i in range(len(symbols) - 1):
+            r = merge_rank.get((symbols[i], symbols[i+1]))
+            if r is not None and (best_rank is None or r < best_rank):
+                best_rank, best_idx = r, i
+        if best_rank is None:
+            break
+        symbols = symbols[:best_idx] + [symbols[best_idx] + symbols[best_idx+1]] + symbols[best_idx+2:]
+    return symbols
+```
+
+**Worked example.** Vocab includes `b'th'`, `b'the'`; merges = `[(b't',b'h'),
+(b' ',b'c'), (b' ',b'a'), (b'th',b'e'), (b' a',b't')]`. Pre-token `'the'` →
+`[b't', b'h', b'e']`:
+
+- Scan merges in order: #0 `(b't',b'h')` is present → apply → `[b'th', b'e']`.
+- Scan again: #0–#2 not present, #3 `(b'th',b'e')` is present → apply →
+  `[b'the']`. Done. → token ID `9`.
+
+## 4. Why Priority-Ordered (and Not "Longest Match")
+
+Several segmentations might give valid token sequences. BPE specifically uses
+priority-ordered merging because of one critical invariant:
+
+> **Encoding must reproduce the same segmentation that training would have
+> produced on this exact pre-token.**
+
+The model's embeddings were trained on *that* segmentation. If you encode
+differently at inference time, you feed the model token IDs it never saw together
+during training, and quality drops.
+
+Counter-example showing the rules disagree. Suppose merges =
+`[(b'b',b'c'), (b'a',b'b')]`, vocab contains `b'ab'` and `b'bc'`, input is `b'abc'`:
+
+| Strategy | Result | Reasoning |
+|---|---|---|
+| Longest-match left-to-right | `[b'ab', b'c']` | Greedy from left |
+| Shortest-tokenization DP | tied at 2 tokens | Either segmentation |
+| **BPE priority-ordered** ✓ | `[b'a', b'bc']` | Merge #0 `(b,c)` fires first |
+
+Same length, different token IDs. Only the BPE-priority output matches training.
+
+## 5. Why Merge at All
+
+The compression benefit *is* real, and it is the practical reason BPE works:
+
+- **Shorter sequences** — attention is O(n²) in sequence length; halving tokens
+  per sentence is ~4× compute savings.
+- **More text per context window** — a 2048-token window covers more characters.
+- **Better learning signal** — the model sees `b'the'` as one unit rather than
+  having to learn that `[t][h][e]` always co-occurs.
+
+Minimum token count is a near-side-effect, not the formal objective. Because
+merges were learned by frequency, common patterns become single tokens and the
+resulting segmentations are usually close to minimal — but the algorithm
+optimizes "reproducibility," not "compactness."
+
+## 6. Domain Matters: Tokenizer ↔ Inference Data
+
+Because the tokenizer encodes the *training distribution* of byte patterns,
+mismatched domains cause two distinct problems:
+
+1. **Compression drops.** A web-trained tokenizer fed Chinese text or chemistry
+   formulas falls back to per-byte tokens (3–4 tokens per character), inflating
+   sequence length 2–3×. Measure with **bytes-per-token**.
+2. **Unfamiliar token IDs.** Even within "English," a sports article might
+   trigger merges the model rarely saw, so its embeddings for those tokens are
+   weak.
+
+Common practice:
+
+- **Broad mixed corpus** for the tokenizer (GPT-2: WebText; Llama: + code +
+  multilingual).
+- **Domain-specific tokenizers** for specialized models (CodeLlama, BioBERT).
+- **Tokenizer extension**: add merges/tokens for a new domain, then continue
+  pre-training the model with the extended embedding table (common in
+  English → Chinese adaptation).
+
+Rule of thumb: **train the tokenizer on data as similar as possible to what the
+model will encode**. The expected per-corpus contrast on this assignment:
+
+- **TinyStories tokenizer** — heavy on simple narrative vocabulary
+  (`b' little'`, `b' said'`). Great on TinyStories, weak on news/code.
+- **OpenWebText tokenizer** — broader (URLs, news terms, code fragments). Better
+  general coverage, but "wastes" vocab capacity on TinyStories.
+
+## 7. Special Tokens Are Never Produced by Merges
+
+Special tokens like `<|endoftext|>` are added to `vocab` directly and are never
+created by, or considered for, BPE merging. The training pipeline:
+
+- **Splits documents on special-token boundaries** before pre-tokenization, so
+  merge counts never cross a `<|endoftext|>`.
+- **Tokenizes specials as a single unit** at encoding time, bypassing the
+  byte-level merge loop. They must be matched in the input text *before* the
+  pre-token regex runs.
+
+This is what the assignment hint refers to: "The `<|endoftext|>` token is
+handled as a special case before the BPE merges are applied."
+
+---
+
 # BPE Training: Key Performance Improvements
 
 Lessons learned while optimizing a Python BPE tokenizer from **14.4 s → 0.77 s** on the
