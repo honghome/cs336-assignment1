@@ -1,7 +1,12 @@
+import math, os
+
 from jaxtyping import Bool, Float, Int
 from torch import Tensor, device
 import torch
 from einops import einsum
+from collections.abc import Iterable
+import numpy.typing as npt
+from typing import IO, Any, BinaryIO
 
 class linear(torch.nn.Module):
     """
@@ -450,3 +455,242 @@ class transformer_lm(torch.nn.Module):
 
         # return softmax(layer_embedding_lm_head, -1)
         return layer_embedding_lm_head
+    
+
+def cross_entropy(
+    inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
+) -> Float[Tensor, ""]:
+    """Given a tensor of inputs and targets, compute the average cross-entropy
+    loss across examples.
+
+    Args:
+        inputs (Float[Tensor, "batch_size vocab_size"]): inputs[i][j] is the
+            unnormalized logit of jth class for the ith example.
+        targets (Int[Tensor, "batch_size"]): Tensor of shape (batch_size,) with the index of the correct class.
+            Each value must be between 0 and `num_classes - 1`.
+
+    Returns:
+        Float[Tensor, ""]: The average cross-entropy loss across examples.
+    """
+    # 1: compute the batch indices
+    batch_size = inputs.shape[0]
+    batch_indices = torch.arange(batch_size, device=inputs.device)
+
+    # 2: select the correct class logit for each example
+    correct_logits = inputs[batch_indices, targets]
+    loss_per_example = inputs.logsumexp(dim=-1) - correct_logits
+    
+    return loss_per_example.mean()
+
+class adamw_cls(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if eps < 0.0:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        beta1, beta2 = betas
+        if not 0.0 <= beta1 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {beta1}")
+        if not 0.0 <= beta2 < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {beta2}")
+
+        defaults = dict(lr=lr, weight_decay=weight_decay, betas=betas, eps=eps)
+        super().__init__(params, defaults)
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            weight_decay = group["weight_decay"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("adamw_cls does not support sparse gradients")
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["t"] = 0
+                    state["m"] = torch.zeros_like(p)
+                    state["v"] = torch.zeros_like(p)
+
+                m = state["m"]
+                v = state["v"]
+                state["t"] += 1
+                t = state["t"]
+
+                # Decoupled weight decay (AdamW).
+                p.data.mul_(1.0 - lr * weight_decay)
+
+                # Update first and second moments.
+                m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                # Bias-corrected Adam step size.
+                step_size = lr * ((1.0 - beta2 ** t) ** 0.5) / (1.0 - beta1 ** t)
+                denom = v.sqrt().add_(eps)
+                p.data.addcdiv_(m, denom, value=-step_size)
+
+        return loss
+
+def lr_cosine_schedule(
+    it: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
+):
+    """
+    Given the parameters of a cosine learning rate decay schedule (with linear
+    warmup) and an iteration number, return the learning rate at the given
+    iteration under the specified schedule.
+
+    Args:
+        it (int): Iteration number to get learning rate for.
+        max_learning_rate (float): alpha_max, the maximum learning rate for
+            cosine learning rate schedule (with warmup).
+        min_learning_rate (float): alpha_min, the minimum / final learning rate for
+            the cosine learning rate schedule (with warmup).
+        warmup_iters (int): T_w, the number of iterations to linearly warm-up
+            the learning rate.
+        cosine_cycle_iters (int): T_c, the number of cosine annealing iterations.
+
+    Returns:
+        Learning rate at the given iteration under the specified schedule.
+    """
+    if warmup_iters > 0 and it < warmup_iters:
+        return it * 1.0 / warmup_iters * max_learning_rate
+    elif cosine_cycle_iters > warmup_iters and it <= cosine_cycle_iters:
+        return min_learning_rate + 0.5 * (1 + math.cos(math.pi*(it-warmup_iters)/(cosine_cycle_iters-warmup_iters))) * (max_learning_rate - min_learning_rate)
+    else:
+        return min_learning_rate
+    
+def run_gradient_clipping(
+        parameters: Iterable[torch.nn.Parameter],
+        max_l2_norm: float
+) -> None:
+    """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
+
+    Args:
+        parameters (Iterable[torch.nn.Parameter]): collection of trainable parameters.
+        max_l2_norm (float): a positive value containing the maximum l2-norm.
+
+    The gradients of the parameters (parameter.grad) should be modified in-place.
+    """
+    if max_l2_norm <= 0:
+        raise ValueError(f"max_l2_norm must be positive, got {max_l2_norm}")
+
+    params = [p for p in parameters if p.grad is not None]
+    if len(params) == 0:
+        return
+
+    grads = [p.grad for p in params]
+    total_norm = torch.sqrt(sum(torch.sum(g * g) for g in grads))
+    clip_coef = max_l2_norm / (total_norm + 1e-6)
+
+    if clip_coef < 1.0:
+        for g in grads:
+            g.mul_(clip_coef)
+
+def get_batch(
+    dataset: npt.NDArray, batch_size: int, context_length: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Given a dataset (a 1D numpy array of integers) and a desired batch size and
+    context length, sample language modeling input sequences and their corresponding
+    labels from the dataset.
+
+    Args:
+        dataset (np.array): 1D numpy array of integer token IDs in the dataset.
+        batch_size (int): Desired batch size to sample.
+        context_length (int): Desired context length of each sampled example.
+        device (str): PyTorch device string (e.g., 'cpu' or 'cuda:0') indicating the device
+            to place the sampled input sequences and labels on.
+
+    Returns:
+        Tuple of torch.LongTensors of shape (batch_size, context_length). The first tuple item
+        is the sampled input sequences, and the second tuple item is the corresponding
+        language modeling labels.
+    """
+    if context_length <= 0:
+        raise ValueError(f"context_length must be positive, got {context_length}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if len(dataset) <= context_length:
+        raise ValueError(
+            f"dataset length ({len(dataset)}) must be greater than context_length ({context_length})"
+        )
+
+    data = torch.as_tensor(dataset, dtype=torch.long)
+    max_start = len(dataset) - context_length
+    starts = torch.randint(0, max_start, (batch_size,), device=data.device)
+    offsets = torch.arange(context_length, device=data.device)
+
+    x = data[starts.unsqueeze(1) + offsets]
+    y = data[starts.unsqueeze(1) + offsets + 1]
+    return x.to(device), y.to(device)
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    out: str | os.PathLike | BinaryIO | IO[bytes],
+):
+    """
+    Given a model, optimizer, and an iteration number, serialize them to disk.
+
+    Args:
+        model (torch.nn.Module): Serialize the state of this model.
+        optimizer (torch.optim.Optimizer): Serialize the state of this optimizer.
+        iteration (int): Serialize this value, which represents the number of training iterations
+            we've completed.
+        out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
+    """
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(payload, out)
+
+
+def load_checkpoint(
+    src: str | os.PathLike | BinaryIO | IO[bytes],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> int:
+    """
+    Given a serialized checkpoint (path or file-like object), restore the
+    serialized state to the given model and optimizer.
+    Return the number of iterations that we previously serialized in
+    the checkpoint.
+
+    Args:
+        src (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialized checkpoint.
+        model (torch.nn.Module): Restore the state of this model.
+        optimizer (torch.optim.Optimizer): Restore the state of this optimizer.
+    Returns:
+        int: the previously-serialized number of iterations.
+    """
+    checkpoint = torch.load(src)
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    return int(checkpoint["iteration"])

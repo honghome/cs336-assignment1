@@ -834,3 +834,301 @@ All three follow the same shape: **reduce with `keepdim=True`** →
 > Softmax / RMSNorm / layernorm get their axis-awareness from the
 > reduction step; the surrounding `exp`/`sqrt`/divide just ride along
 > with broadcasting.
+
+## PyTorch optimizer internals (p, p.grad, p.data, state)
+
+When writing a custom optimizer, the same four objects appear repeatedly:
+
+- `p`: one trainable parameter tensor (usually `torch.nn.Parameter`).
+- `p.grad`: gradient for `p`, written by `loss.backward()`.
+- `p.data`: raw parameter values to update in-place.
+- `self.state[p]`: persistent optimizer memory for this parameter.
+
+### Minimal mental model
+
+One training iteration is:
+
+1. `optimizer.zero_grad()`
+2. forward pass -> scalar `loss`
+3. `loss.backward()` -> fills `p.grad`
+4. `optimizer.step()` -> reads `p.grad`, updates `p.data`
+
+So an optimizer is simply the code that consumes gradients and mutates
+parameters.
+
+### Why `state` exists
+
+Stateful optimizers (Adam/AdamW) keep extra running statistics per parameter.
+Typical keys are:
+
+- `state["t"]`: step counter
+- `state["m"]`: first moment (EMA of gradients)
+- `state["v"]`: second moment (EMA of squared gradients)
+
+That state is stored in `self.state[p]` so every parameter has its own history.
+
+### AdamW-style step flow in code
+
+```python
+for group in self.param_groups:
+    lr = group["lr"]
+    beta1, beta2 = group["betas"]
+    eps = group["eps"]
+    wd = group["weight_decay"]
+
+    for p in group["params"]:
+        if p.grad is None:
+            continue
+
+        grad = p.grad
+        state = self.state[p]
+        if len(state) == 0:
+            state["t"] = 0
+            state["m"] = torch.zeros_like(p)
+            state["v"] = torch.zeros_like(p)
+
+        m = state["m"]
+        v = state["v"]
+        state["t"] += 1
+        t = state["t"]
+
+        # Decoupled weight decay.
+        p.data.mul_(1.0 - lr * wd)
+
+        # Moment updates.
+        m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+        v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+        # Bias-corrected Adam update.
+        step_size = lr * ((1.0 - beta2 ** t) ** 0.5) / (1.0 - beta1 ** t)
+        denom = v.sqrt().add_(eps)
+        p.data.addcdiv_(m, denom, value=-step_size)
+```
+
+### Tiny scalar example
+
+Assume one scalar parameter:
+
+- initial `p=1.0`, `grad=0.5`
+- `lr=0.1`, `wd=0.01`, `beta1=0.9`, `beta2=0.999`
+- initial `m=0`, `v=0`, `t=0`
+
+After one step:
+
+- `t=1`
+- decay: `p = p * (1 - lr*wd) = 1.0 * 0.999 = 0.999`
+- `m = 0.9*0 + 0.1*0.5 = 0.05`
+- `v = 0.999*0 + 0.001*0.25 = 0.00025`
+- then Adam update subtracts a scaled version of `m/(sqrt(v)+eps)`
+
+This is why AdamW is called *stateful*: each parameter carries running memory
+(`m`, `v`, `t`) across steps.
+
+### One parameter group vs multiple groups
+
+In `for group in self.param_groups`, a *group* is just a set of parameters
+sharing the same optimizer hyperparameters (`lr`, `weight_decay`, `betas`,
+`eps`, ...).
+
+Use this rule:
+
+- Start with **one group**.
+- Split into **multiple groups** only when some parameters should use
+  different hyperparameters.
+
+Typical reasons to split groups:
+
+- Different weight decay policy (most common).
+- Different learning rates (e.g., smaller LR for embeddings, larger LR for
+  a newly added head).
+- Different optimizer constants (`betas`, `eps`) for specific tensors.
+
+Transformer default in many codebases:
+
+- decay group: matrix-like weights (attention/MLP projection weights)
+- no-decay group: norm weights and biases (`weight_decay=0.0`)
+
+Minimal pattern:
+
+```python
+decay_params = []
+no_decay_params = []
+
+for name, p in model.named_parameters():
+    if not p.requires_grad:
+        continue
+    if name.endswith("bias") or "norm" in name.lower():
+        no_decay_params.append(p)
+    else:
+        decay_params.append(p)
+
+optimizer = adamw_cls(
+    [
+        {"params": decay_params, "weight_decay": 0.01},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ],
+    lr=3e-4,
+    betas=(0.9, 0.95),
+    eps=1e-8,
+)
+```
+
+If you cannot clearly justify a different setting, keep one group.
+
+### How to locate specific parameters inside `step`
+
+If you need special logic for only some parameters, use one of these patterns.
+
+Pattern A (preferred): encode intent in groups before training
+
+```python
+optimizer = adamw_cls(
+    [
+        {"params": decay_params, "weight_decay": 0.01, "tag": "decay"},
+        {"params": no_decay_params, "weight_decay": 0.0, "tag": "no_decay"},
+    ],
+    lr=3e-4,
+)
+
+for group in optimizer.param_groups:
+    tag = group.get("tag", "default")
+    for p in group["params"]:
+        # p-specific update, with behavior selected by group tag
+        if tag == "no_decay":
+            ...
+        else:
+            ...
+```
+
+Pattern B (fallback): keep a param -> name map and branch by name
+
+```python
+id_to_name = {id(p): n for n, p in model.named_parameters()}
+
+for group in optimizer.param_groups:
+    for p in group["params"]:
+        name = id_to_name[id(p)]
+        if name.endswith("bias") or "norm" in name.lower():
+            ...
+```
+
+Notes:
+
+- Pattern A is cleaner and usually enough.
+- Pattern B is useful when the rule truly depends on module name.
+- You can also use `p.ndim == 1` as a quick heuristic for norm/bias-like
+  parameters, but names are more explicit.
+
+## Gradient clipping (global L2 norm)
+
+Gradient clipping is applied after `loss.backward()` and before
+`optimizer.step()`.
+
+### Conceptual math object vs code tensor
+
+- In math, $g$ usually means one concatenated global gradient vector.
+- In code, each `g` in a loop like `for g in grads:` is a single
+    `torch.Tensor` (same shape as one parameter's gradient).
+
+Both views are consistent: the global $g$ is what you get by flattening and
+concatenating all per-parameter gradient tensors.
+
+### Global norm and clipping rule
+
+Compute the global L2 norm:
+
+$$
+\|g\|_2 = \sqrt{\sum_i g_i^2}.
+$$
+
+Given max norm $M$ and small stability constant $\epsilon$:
+
+- if $\|g\|_2 \le M$, keep gradients unchanged
+- if $\|g\|_2 > M$, scale all gradients by
+
+$$
+    ext{scale} = \frac{M}{\|g\|_2 + \epsilon},
+\quad g \leftarrow g \cdot \text{scale}.
+$$
+
+This keeps direction and shrinks only magnitude.
+
+### Numeric example (properly formatted)
+
+$$
+\|g\|_2 = 20,\quad M = 1,\quad \epsilon \approx 0
+$$
+
+$$
+    ext{scale} = \frac{M}{\|g\|_2 + \epsilon}
+\approx \frac{1}{20} = 0.05
+$$
+
+$$
+g \leftarrow 0.05\,g
+$$
+
+So the new norm is approximately $1$.
+
+## Function implementation walkthrough (current code)
+
+This section explains what each training utility does line by line in practical
+terms.
+
+### AdamW `step`
+
+Core flow:
+
+1. Read group hyperparameters (`lr`, `weight_decay`, `betas`, `eps`).
+2. For each parameter `p`, skip if `p.grad is None`.
+3. Initialize per-parameter state on first use:
+    `state["t"]`, `state["m"]`, `state["v"]`.
+4. Apply decoupled weight decay directly on parameter values.
+5. Update moment estimates:
+
+$$
+m \leftarrow \beta_1 m + (1-\beta_1)g,
+\quad
+v \leftarrow \beta_2 v + (1-\beta_2)g^2.
+$$
+
+6. Compute bias-corrected step size and perform elementwise update with
+    `addcdiv_`.
+
+Interpretation: each parameter has its own running memory (`m`, `v`, `t`),
+while groups share hyperparameters.
+
+### Cosine LR schedule with warmup
+
+The schedule has three phases:
+
+1. Warmup (`it < warmup_iters`): linear ramp from `0` to `max_learning_rate`.
+2. Cosine decay (`warmup_iters <= it <= cosine_cycle_iters`): smooth decay to
+    `min_learning_rate`.
+3. Tail (`it > cosine_cycle_iters`): constant `min_learning_rate`.
+
+Useful boundary checks:
+
+- at `it = warmup_iters`, LR equals `max_learning_rate`
+- at `it = cosine_cycle_iters`, LR equals `min_learning_rate`
+
+### Global gradient clipping
+
+Implementation meaning of `grads`:
+
+- `grads` is a list of gradient tensors (`torch.Tensor`) for parameters that
+  currently have gradients.
+- each tensor keeps the original parameter shape.
+
+Then the function:
+
+1. Computes total global norm from all tensors.
+2. Computes clip coefficient:
+
+$$
+	ext{clip\_coef} = \frac{M}{\|g\|_2 + 10^{-6}}.
+$$
+
+3. If `clip_coef < 1.0`, scales every gradient tensor in place.
+
+This preserves gradient direction and only reduces magnitude when needed.

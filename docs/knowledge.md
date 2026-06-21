@@ -4692,5 +4692,620 @@ This is the "Scaled" in "Scaled Dot-Product Attention", from
 > so softmax operates in its sensitive region — soft, smooth, and
 > differentiable — independent of the per-head dimension.
 
+---
+
+## 24. Resource Accounting
+
+This section answers the `transformer_accounting` problem by doing explicit
+matrix-multiply FLOPs accounting for the assignment Transformer LM.
+
+### 24.1 FLOPs Rule Used
+
+For $A \in \mathbb{R}^{m \times n}$ and $B \in \mathbb{R}^{n \times p}$,
+
+$$\text{FLOPs}(AB) = 2mnp.$$
+
+We apply this to every major matmul in the forward pass.
+
+### 24.2 Per-Layer Matmul Inventory (Sequence Length $T$)
+
+Let model width be $d$, heads $h$, per-head dim $d_k=d/h$, and FFN inner dim
+$d_{ff}$. For one layer:
+
+| Component | Matmul(s) | FLOPs |
+|---|---|---:|
+| Q, K, V, O projections | $T\times d$ by $d\times d$ (4 times) | $8Td^2$ |
+| Attention score/product | $QK^\top$ and $\text{Attn}V$ | $4T^2d$ |
+| FFN (SwiGLU linears) | $w_1,w_3,w_2$ | $6Td\,d_{ff}$ |
+
+LM head (once at end):
+
+$$2TdV$$
+
+where $V$ is vocab size.
+
+So total forward FLOPs (matmuls only):
+
+$$
+	ext{FLOPs}_{\text{total}} = N\left(8Td^2 + 4T^2d + 6Td\,d_{ff}\right) + 2TdV
+$$
+
+for $N$ layers.
+
+### 24.3 (a) GPT-2 XL-Shaped Model: Parameters and Memory
+
+Configuration:
+
+- $V=50{,}257$
+- $T=1{,}024$
+- $N=48$
+- $d=1{,}600$
+- $h=25$
+- $d_{ff}=4{,}288$
+
+Trainable parameter count (assignment architecture, untied input/output
+embeddings):
+
+$$
+\#\theta = 2Vd + N(4d^2 + 3dd_{ff} + 2d) + d
+$$
+
+Numerically:
+
+$$
+\#\theta = 1{,}640{,}452{,}800 \text{ parameters.}
+$$
+
+At fp32 (4 bytes/parameter), model weights require:
+
+$$
+6{,}561{,}811{,}200\text{ bytes} \approx 6.11\text{ GiB}.
+$$
+
+**Deliverable (a):** This GPT-2 XL-shaped assignment model has
+$1{,}640{,}452{,}800$ trainable parameters. Storing just the weights in fp32
+requires about $6.11$ GiB of memory.
+
+### 24.4 (b) GPT-2 XL-Shaped Forward FLOPs at $T=1024$
+
+Using the formulas above:
+
+- QKV+O projections (all layers): $1{,}006{,}632{,}960{,}000$
+- Attention matmuls $(QK^\top + AV)$ (all layers): $322{,}122{,}547{,}200$
+- FFN matmuls $(w_1,w_3,w_2)$ (all layers): $2{,}023{,}332{,}249{,}600$
+- LM head (final): $164{,}682{,}137{,}600$
+
+Total:
+
+$$
+3{,}516{,}769{,}894{,}400\text{ FLOPs} \approx 3.52\times 10^{12}\text{ FLOPs.}
+$$
+
+**Deliverable (b):** The required matmuls are projection linears,
+attention's $QK^\top$ and $AV$, FFN linears, and the final LM head; together
+they cost about $3.52\times10^{12}$ FLOPs for one forward pass at
+context length 1024.
+
+### 24.5 (c) Which Parts Dominate FLOPs?
+
+For this XL-shaped setup at $T=1024$:
+
+- FFN matmuls: $57.53\%$
+- Projections (QKV+O): $28.62\%$
+- Attention matmuls: $9.16\%$
+- LM head: $4.68\%$
+
+**Deliverable (c):** FFN matmuls dominate compute by a wide margin, followed by
+the four attention projection linears. At this context length, the quadratic
+attention core is comparatively smaller than FFN compute.
+
+### 24.6 (d) Small / Medium / Large Proportional Breakdown
+
+Assumption for assignment architecture: $d_{ff}$ is the nearest multiple of 64
+to $\frac{8}{3}d$.
+
+- Small: $N=12, d=768, h=12, d_{ff}=2048$
+- Medium: $N=24, d=1024, h=16, d_{ff}=2752$
+- Large: $N=36, d=1280, h=20, d_{ff}=3392$
+
+All at $T=1024$, $V=50{,}257$.
+
+| Model | QKV+O proj | Attn matmuls | FFN matmuls | LM head |
+|---|---:|---:|---:|---:|
+| Small | 19.88% | 13.25% | 39.76% | 27.10% |
+| Medium | 24.83% | 12.42% | 50.05% | 12.70% |
+| Large | 27.32% | 10.93% | 54.30% | 7.45% |
+
+**Deliverable (d):** As model size increases, FFN and projection FLOPs take a
+larger share, while the LM head share drops substantially. The attention-core
+($QK^\top$ and $AV$) proportion decreases because it scales as $T^2d$, whereas
+the dense width terms grow faster with larger $d$ and $d_{ff}$ at fixed $T$.
+
+### 24.7 (e) GPT-2 XL with Context Length 16,384
+
+Holding XL width/depth fixed and changing only $T:1024\to16384$:
+
+- New total FLOPs: $133{,}577{,}729{,}638{,}400$
+- Increase factor: $\approx 37.98\times$
+
+Proportions shift to:
+
+- Attention matmuls: $61.73\%$
+- FFN matmuls: $24.24\%$
+- QKV+O projections: $12.06\%$
+- LM head: $1.97\%$
+
+**Deliverable (e):** Total forward FLOPs rise by about $38\times$ when context
+goes from 1024 to 16,384, because the quadratic attention terms become dominant.
+At long context, the compute mix flips: attention core becomes the largest
+contributor by far.
+
+---
+
+## 25. Training a Transformer LM - Cross-Entropy Loss
+
+This section explains how to train a decoder-only Transformer language model
+using next-token prediction and cross-entropy loss.
+
+### 25.1 Objective in One Line
+
+Given tokens $x_0, x_1, \dots, x_{T-1}$, train the model to predict
+$x_{t+1}$ from the prefix $x_{\le t}$.
+
+### 25.2 Input/Target Construction
+
+From a token sequence of length $T+1$:
+
+- model input: $x_{0:T}$ (length $T$)
+- labels/targets: $x_{1:T+1}$ (length $T$)
+
+For batched training:
+
+- `inputs`: shape $(B, T)$, integer token IDs
+- `targets`: shape $(B, T)$, integer token IDs
+
+### 25.3 Model Output and Logits
+
+The Transformer LM returns logits:
+
+$$
+	ext{logits} \in \mathbb{R}^{B \times T \times V}
+$$
+
+where $V$ is vocabulary size and `logits[b, t, :]` are unnormalized scores for
+the next token after `inputs[b, t]`.
+
+Important implementation note:
+
+- During training, pass logits directly to cross-entropy.
+- Do not apply softmax before cross-entropy; the loss function handles the
+  normalization internally in a numerically stable way.
+
+### 25.4 Cross-Entropy Formula
+
+Think of cross-entropy at one token position as:
+
+1. Convert logits into probabilities with softmax.
+2. Look up the probability assigned to the correct token.
+3. Take negative log of that probability.
+
+So for one position with target class $y$ and logits $z \in \mathbb{R}^{V}$:
+
+$$
+\ell(z, y) = -\log\left(\frac{e^{z_y}}{\sum_j e^{z_j}}\right)
+= -z_y + \log\sum_j e^{z_j}.
+$$
+
+Both forms are identical.
+
+- Left form is conceptually clear: "negative log probability of the right
+  class."
+- Right form is algebraically expanded and is what implementations use for
+  numerical stability.
+
+Quick numeric example (one token, vocab size 4):
+
+- logits $z = [2, 1, 0, -1]$
+- target index $y=0$
+
+Softmax probability for class 0:
+
+$$
+p(y=0) = \frac{e^2}{e^2+e^1+e^0+e^{-1}} \approx 0.6439
+$$
+
+Loss:
+
+$$
+\ell = -\log(0.6439) \approx 0.440.
+$$
+
+If the same logits had target $y=3$, then
+$p(y=3) \approx 0.0321$ and $\ell \approx 3.44$ (much worse), which matches
+the intuition: low probability on the true class means high penalty.
+
+For language modeling over all tokens in a batch:
+
+$$
+\mathcal{L} = \frac{1}{BT}\sum_{b=1}^{B}\sum_{t=1}^{T}
+\ell\big(\text{logits}_{b,t,:},\ \text{targets}_{b,t}\big).
+$$
+
+### 25.5 Shape Handling in Code
+
+Most CE implementations expect shape `(N, C)` for logits and `(N,)` for target
+indices. So flatten time and batch:
+
+- `logits_2d = logits.reshape(B*T, V)`
+- `targets_1d = targets.reshape(B*T)`
+
+Then:
+
+- `loss = cross_entropy(logits_2d, targets_1d)`
+
+### 25.6 Why This Works for LM
+
+Cross-entropy maximizes the log-probability of the correct next token at each
+position. Since every token position provides a supervised signal, one forward
+pass trains on all $B \times T$ prediction tasks simultaneously.
+
+### 25.7 Common Pitfalls
+
+- Applying softmax before CE (double-normalization, weaker gradients).
+- Off-by-one shift mistakes (input and target not aligned by one token).
+- Wrong dtype for targets (`targets` must be integer class indices).
+- Ignoring causal masking in the Transformer block.
+
+### 25.8 Minimal Training Step (Pseudo-Code)
+
+```python
+inputs, targets = get_batch(...)            # (B, T), (B, T)
+logits = model(inputs)                      # (B, T, V)
+loss = cross_entropy(
+    logits.reshape(-1, logits.size(-1)),    # (B*T, V)
+    targets.reshape(-1),                    # (B*T,)
+)
+loss.backward()
+optimizer.step()
+optimizer.zero_grad(set_to_none=True)
+```
+
+### 25.9 TL;DR
+
+- Shift tokens by one to build `(inputs, targets)`.
+- Model outputs logits for each position.
+- Flatten `(B, T, V)` and `(B, T)` to `(B*T, V)` and `(B*T,)`.
+- Use cross-entropy directly on logits (no pre-softmax).
+
+---
+
+## 26. Perplexity
+
+Perplexity is the standard evaluation metric for language models. It is just
+the exponentiated average cross-entropy loss.
+
+### 26.1 Definition
+
+For a sequence of length $m$ with token-level losses $\ell_1, \ldots, \ell_m$:
+
+$$
+	ext{perplexity} = \exp\left(\frac{1}{m}\sum_{i=1}^{m}\ell_i\right).
+$$
+
+### 26.2 Intuition
+
+Think of perplexity as "how many equally likely choices the model feels it has"
+on average.
+
+- Lower perplexity means the model is more confident and more accurate.
+- Perplexity of $1$ is perfect prediction.
+- Larger perplexity means the model is more uncertain.
+
+### 26.3 Relationship to Cross-Entropy
+
+If the average cross-entropy is $\bar{\ell}$, then:
+
+$$
+	ext{perplexity} = e^{\bar{\ell}}.
+$$
+
+So:
+
+- cross-entropy is what you minimize during training,
+- perplexity is what you often report during evaluation.
+
+### 26.4 Concrete Examples
+
+- If $\bar{\ell} = 0$, then $\text{perplexity} = e^0 = 1$.
+- If $\bar{\ell} = \log 10$, then $\text{perplexity} = 10$.
+
+That second example means the model is, on average, about as uncertain as
+choosing among 10 equally plausible options.
+
+### 26.5 TL;DR
+
+- Perplexity = `exp(average cross-entropy)`.
+- Cross-entropy is the training loss.
+- Perplexity is the evaluation metric.
+- Lower is better; `1` is perfect.
+
+---
+
+## 27. Optimizers: SGD and AdamW
+
+An optimizer is the rule that updates model parameters after the backward pass.
+The model gives us gradients; the optimizer turns those gradients into actual
+parameter changes.
+
+### 27.1 The Training Loop
+
+The usual sequence is:
+
+1. Forward pass: compute logits.
+2. Loss: compare logits to targets.
+3. Backward pass: compute gradients.
+4. Optimizer step: update parameters.
+
+In code, this often looks like:
+
+```python
+optimizer.zero_grad()
+logits = model(inputs)
+loss = cross_entropy(logits, targets)
+loss.backward()
+optimizer.step()
+```
+
+### 27.2 SGD
+
+Stochastic Gradient Descent (SGD) updates a parameter by moving it in the
+direction that reduces the loss:
+
+$$
+	heta \leftarrow \theta - \alpha \nabla L(\theta)
+$$
+
+where:
+
+- $\theta$ is the parameter
+- $\alpha$ is the learning rate
+- $\nabla L(\theta)$ is the gradient
+
+This is the simplest optimizer: if the gradient says "go down," SGD takes a
+step down.
+
+### 27.3 AdamW
+
+AdamW is a more advanced optimizer that keeps extra running statistics for each
+parameter:
+
+- first moment $m$: a running average of gradients
+- second moment $v$: a running average of squared gradients
+
+These help AdamW take more stable steps than plain SGD.
+
+The running averages are updated as:
+
+$$
+m \leftarrow \beta_1 m + (1 - \beta_1) g
+$$
+
+$$
+v \leftarrow \beta_2 v + (1 - \beta_2) g^2
+$$
+
+where $g$ is the current gradient.
+
+Typical defaults are:
+
+- $\beta_1 = 0.9$
+- $\beta_2 = 0.999$
+
+### 27.4 AdamW Update Rule
+
+AdamW combines two effects:
+
+1. **Weight decay**: pull parameters slowly toward zero.
+
+$$
+	heta \leftarrow \theta - \alpha \lambda \theta
+$$
+
+2. **Gradient-based update**: use the moment estimates to scale the step.
+
+$$
+	heta \leftarrow \theta - \alpha \frac{m}{\sqrt{v} + \epsilon}
+$$
+
+Combined, this is often written as:
+
+$$
+	heta \leftarrow \theta - \alpha \lambda \theta - \alpha \frac{m}{\sqrt{v} + \epsilon}
+$$
+
+### 27.5 Intuition for $m$ and $v$
+
+- $m$ remembers the recent direction of the gradients.
+- $v$ remembers how large or noisy the gradients are.
+
+If $m$ is large, the update pushes more strongly in that direction. If $v$ is
+large, the update becomes smaller because the step is divided by
+$\sqrt{v} + \epsilon$.
+
+### 27.6 Why AdamW Is Useful
+
+AdamW usually trains large neural networks more smoothly than SGD because it
+adapts to each parameter's gradient history. The extra memory cost is the price
+for this stability.
+
+### 27.7 TL;DR
+
+- An optimizer updates parameters using gradients.
+- SGD is the basic update rule.
+- AdamW stores extra running averages $m$ and $v$.
+- AdamW also applies weight decay separately.
+- The result is usually more stable training than plain SGD.
+
+### 27.8 What Exactly Are `m`, `v`, and `t` in Our Code
+
+In our `adamw_cls`, optimizer state is indexed by parameter tensor `p`:
+
+- `state = self.state[p]`
+
+So `m`, `v`, and `t` are **not global**. They are per-parameter-tensor state.
+
+For each parameter tensor `p`:
+
+- `m`: tensor with the same shape as `p`
+- `v`: tensor with the same shape as `p`
+- `t`: one scalar step counter for that `p`
+
+That means if a model has `K` trainable parameter tensors, it has:
+
+- `K` separate `m` tensors
+- `K` separate `v` tensors
+- `K` separate `t` counters
+
+### 27.9 Count for This `transformer_lm`
+
+In this implementation:
+
+- each `linear` has only one trainable tensor (`weight`, no bias)
+- each `rmsnorm` has one trainable tensor (`weight`)
+- each transformer block has 9 trainable tensors total
+
+Per block:
+
+| Component | Parameter tensors |
+|---|---:|
+| `ln1`, `ln2` | 2 |
+| `q_proj`, `k_proj`, `v_proj`, `output_proj` | 4 |
+| `ffn.w1`, `ffn.w2`, `ffn.w3` | 3 |
+| Total per block | 9 |
+
+Whole `transformer_lm`:
+
+- token embedding: 1
+- all blocks: `9 * num_layers`
+- final norm: 1
+- lm head: 1
+
+So total trainable parameter tensors is:
+
+$$
+9 \cdot \text{num\_layers} + 3
+$$
+
+and the number of `m/v/t` state groups is the same:
+
+$$
+9 \cdot \text{num\_layers} + 3
+$$
+
+Example with `num_layers = 3` (the current test config):
+
+- total parameter tensors: `30`
+- total `m` tensors: `30`
+- total `v` tensors: `30`
+- total `t` counters: `30`
+
+### 27.10 Memory Implication
+
+`m` and `v` are full-size tensors, so AdamW increases optimizer memory a lot.
+In fp32, a common rough budget (ignoring activations) is:
+
+- parameters: `1x`
+- gradients: `1x`
+- first moment `m`: `1x`
+- second moment `v`: `1x`
+
+Total is often around `4x` parameter memory during training.
+
+### 27.11 Learning Rate: Linear Warmup + Cosine Decay
+
+Our schedule uses three phases controlled by:
+
+- `T_w` = `warmup_iters`
+- `T_c` = `cosine_cycle_iters`
+- `alpha_max` = `max_learning_rate`
+- `alpha_min` = `min_learning_rate`
+
+For iteration `t`, the learning rate is piecewise:
+
+$$
+\alpha(t) =
+\begin{cases}
+\alpha_{\max}\,\frac{t}{T_w}, & t < T_w, \\
+\alpha_{\min} + \frac{1}{2}\left(1 + \cos\left(\pi\frac{t-T_w}{T_c-T_w}\right)\right)(\alpha_{\max}-\alpha_{\min}), & T_w \le t \le T_c, \\
+\alpha_{\min}, & t > T_c.
+\end{cases}
+$$
+
+Interpretation:
+
+- Early training: ramp up linearly from `0` to `alpha_max`.
+- Main training: decay smoothly from `alpha_max` to `alpha_min` with a cosine curve.
+- Late training: keep a stable floor at `alpha_min`.
+
+Boundary checks:
+
+- At `t = T_w`, cosine phase starts at `alpha_max`.
+- At `t = T_c`, cosine phase ends at `alpha_min`.
+- For all `t > T_c`, LR remains `alpha_min`.
+
+Small example (`alpha_max=1.0`, `alpha_min=0.1`, `T_w=7`, `T_c=21`):
+
+- `t=0` -> `0.0`
+- `t=7` -> `1.0`
+- `t=14` -> `0.55`
+- `t=21` -> `0.1`
+- `t=22` -> `0.1`
+
+This is exactly the behavior expected by the optimizer schedule unit test.
+
+### 27.12 Gradient Clipping (Global L2 Norm)
+
+Gradient clipping is a safety step applied after `loss.backward()` and before
+`optimizer.step()`.
+
+Let all parameter gradients be viewed as one concatenated vector $g$. Compute:
+
+$$
+\|g\|_2 = \sqrt{\sum_i g_i^2}
+$$
+
+Given a maximum norm $M$:
+
+- if $\|g\|_2 \le M$, keep gradients unchanged
+- if $\|g\|_2 > M$, scale every gradient by
+
+$$
+	ext{scale} = \frac{M}{\|g\|_2 + \epsilon}
+$$
+
+and apply
+
+$$
+g \leftarrow g \cdot \text{scale}.
+$$
+
+This preserves gradient direction and only shrinks magnitude.
+
+Small numeric example:
+
+$$
+\|g\|_2 = 20,\quad M=1,\quad \epsilon \approx 0
+$$
+
+$$
+	ext{scale} = \frac{M}{\|g\|_2 + \epsilon} \approx \frac{1}{20} = 0.05
+$$
+
+$$
+g \leftarrow 0.05\,g
+$$
+
+So the new norm is approximately $1$.
+
 
 
