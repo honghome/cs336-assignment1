@@ -5,6 +5,7 @@ from torch import Tensor, device
 import torch
 from einops import einsum
 from collections.abc import Iterable
+import numpy as np
 import numpy.typing as npt
 from typing import IO, Any, BinaryIO
 
@@ -639,14 +640,15 @@ def get_batch(
             f"dataset length ({len(dataset)}) must be greater than context_length ({context_length})"
         )
 
-    data = torch.as_tensor(dataset, dtype=torch.long)
     max_start = len(dataset) - context_length
-    starts = torch.randint(0, max_start, (batch_size,), device=data.device)
-    offsets = torch.arange(context_length, device=data.device)
+    starts = torch.randint(0, max_start, (batch_size,)).numpy()
 
-    x = data[starts.unsqueeze(1) + offsets]
-    y = data[starts.unsqueeze(1) + offsets + 1]
-    return x.to(device), y.to(device)
+    x_np = np.stack([dataset[start : start + context_length] for start in starts])
+    y_np = np.stack([dataset[start + 1 : start + context_length + 1] for start in starts])
+
+    x = torch.as_tensor(x_np, dtype=torch.long, device=device)
+    y = torch.as_tensor(y_np, dtype=torch.long, device=device)
+    return x, y
 
 def save_checkpoint(
     model: torch.nn.Module,

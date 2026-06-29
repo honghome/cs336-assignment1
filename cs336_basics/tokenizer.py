@@ -40,11 +40,9 @@ class Tokenizer:
 
     @classmethod
     def from_file(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
-        self = cls.__new__(cls)
-        vocab = tool.load_bpe(vocab_filepath)
-        merges = tool.load_bpe(merges_filepath)
-        self._init(vocab, merges, special_tokens)
-        return self
+        vocab = tool.load_bpe_vocab(vocab_filepath)
+        merges = tool.load_bpe_merges(merges_filepath)
+        return cls(vocab, merges, special_tokens)
     
     def _pre_tokenize(self, text: str) -> list[bytes]:
         token_list = []
