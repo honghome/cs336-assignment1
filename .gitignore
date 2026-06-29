@@ -119,6 +119,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Azure ML local staging
+.aml_staging/
+
 # Environments
 .env
 .venv
@@ -164,3 +167,21 @@ cython_debug/
 
 # Assignment datasets (large, local-only)
 data/
+
+# Generated experiment artifacts (large, local-only)
+tmp/
+*.bin
+*.pt
+*.prof
+profile_output.txt
+
+# Trained tokenizer/model artifacts. Keep small experiment configs under
+# training/aml/ trackable.
+training/**/*.pkl
+training/**/*.bin
+training/**/*.pt
+training/*.ipynb
+!training/training.ipynb
+!training/aml/
+!training/aml/*.py
+!training/aml/*.yaml
