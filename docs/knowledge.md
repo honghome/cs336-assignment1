@@ -1246,6 +1246,94 @@ wrong) prefixes. An early generation mistake puts the model in an input
 distribution it never saw during training. In practice modern LMs handle this
 remarkably well, but it's why long generations can drift into nonsense.
 
+### Practical decoding for this assignment
+
+The model returns **logits**, not probabilities:
+
+```python
+logits = model(input_ids)          # (batch, sequence_length, vocab_size)
+next_logits = logits[0, -1, :]     # (vocab_size,)
+```
+
+For generation, only the last position matters because it predicts the token
+after the whole current prefix. Earlier positions predicted earlier next-token
+distributions, which are no longer needed.
+
+Basic sampling step:
+
+```python
+next_logits = next_logits / temperature
+probs = torch.softmax(next_logits, dim=-1)
+next_id = torch.multinomial(probs, num_samples=1)
+```
+
+Important controls:
+
+- `temperature < 1.0`: sharper distribution, safer and more repetitive.
+- `temperature = 1.0`: use the model's natural logit scale.
+- `temperature > 1.0`: flatter distribution, more random and more error-prone.
+- `temperature -> 0`: equivalent to greedy decoding with `argmax`.
+- `top_p`: nucleus sampling. Sort probabilities high-to-low, keep the smallest
+  set whose cumulative probability is at least `p`, renormalize, then sample
+  only from that set.
+
+Generation stop conditions:
+
+- Stop when the sampled token is the `<|endoftext|>` token.
+- Also stop when `max_new_tokens` is reached, so bad generations cannot run
+  forever.
+
+Context length detail for this repo:
+
+```python
+model_input = generated_ids[:, -context_length:]
+```
+
+The TinyStories model was trained with `context_length = 256`, so after the
+generated sequence grows past 256 tokens, feed only the most recent 256 tokens
+back into the model. This is a simple sliding-window decode; it avoids calling
+the model with a sequence longer than its RoPE/cache length.
+
+Minimal full loop shape:
+
+```python
+@torch.no_grad()
+def generate_ids(model, prompt_ids, max_new_tokens, context_length, eos_id,
+                 temperature=1.0, top_p=None):
+    generated = prompt_ids.clone()
+    model.eval()
+
+    for _ in range(max_new_tokens):
+        model_input = generated[:, -context_length:]
+        logits = model(model_input)
+        next_logits = logits[0, -1, :]
+
+        if temperature <= 0:
+            next_id = torch.argmax(next_logits).view(1, 1)
+        else:
+            probs = torch.softmax(next_logits / temperature, dim=-1)
+            # If top_p is set, filter probs before this multinomial call.
+            next_id = torch.multinomial(probs, num_samples=1).view(1, 1)
+
+        generated = torch.cat([generated, next_id.to(generated.device)], dim=1)
+        if eos_id is not None and next_id.item() == eos_id:
+            break
+
+    return generated
+```
+
+Tokenizer connection:
+
+```python
+prompt_ids = tokenizer.encode(prompt)
+input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+output_ids = generate_ids(model, input_ids, ...)
+text = tokenizer.decode(output_ids[0].tolist())
+```
+
+Training uses `torch.long` token IDs for embeddings and cross-entropy targets;
+generation should also feed `torch.long` IDs into the model.
+
 ## 12. Q&A: Common Stumbling Blocks
 
 ### Q: How is the loss calculated? Once for the whole sequence, or once per position?
@@ -5306,6 +5394,440 @@ g \leftarrow 0.05\,g
 $$
 
 So the new norm is approximately $1$.
+
+---
+
+# Transformer Training Experiments
+
+This section records the TinyStories Transformer experiments run on Azure ML and
+the conclusions to carry into the assignment write-up.
+
+## Learning Rate Sweep
+
+Goal: compare several maximum learning rates under the same model, optimizer,
+dataset, and batch shape, then identify a stable high-performing LR and the edge
+of instability.
+
+### Fixed Hyperparameters
+
+These settings were held fixed for the learning-rate comparison:
+
+| Hyperparameter | Value |
+| --- | ---: |
+| Dataset | TinyStories tokenized `int32` memmap binaries |
+| Vocab size | 10,000 |
+| Context length | 256 |
+| Batch size | 32 |
+| `d_model` | 512 |
+| Layers | 4 |
+| Attention heads | 16 |
+| `d_ff` | 1344 |
+| RoPE theta | 10,000 |
+| Optimizer | AdamW |
+| Weight decay | 0.01 |
+| Gradient clipping | 1.0 |
+| LR schedule | Linear warmup + cosine decay |
+| Metrics backend | AzureML native run metrics |
+
+### Run Settings And Metrics
+
+The first five rows are 10k-step LR screening/probe runs. The final row is the
+40k-step baseline rerun with metrics enabled, included as a full-budget
+reference.
+
+| Run ID | Display name | Max LR | Min LR | Warmup | Max iters | Best val loss | Final val loss | Final val ppl | Runtime | Stability |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `cyan_office_vvg3sytpy9` | `cs336-lr-1e-4-short-riKfo` | 1e-4 | 1e-5 | 1,000 | 10,000 | 1.9102 | 1.9257 | 6.86 | 460.1s | Stable, slow learning |
+| `honest_lemon_mhplxq1sz6` | `cs336-lr-3e-4-short-OsGcM` | 3e-4 | 3e-5 | 1,000 | 10,000 | 1.6272 | 1.6709 | 5.32 | 458.6s | Stable baseline LR |
+| `olive_pillow_jrt4mwb4cc` | `cs336-lr-1e-3-short-TXeTQ` | 1e-3 | 1e-4 | 1,000 | 10,000 | 1.4913 | 1.5021 | 4.49 | 454.9s | Stable, best short run |
+| `cyan_cart_w00177qq62` | `cs336-lr-3e-3-short-dI6G0` | 3e-3 | 3e-4 | 1,000 | 10,000 | 1.5023 | 1.5023 | 4.49 | 554.1s | Stable, no divergence |
+| `upbeat_lock_54rymc868v` | `cs336-lr-1e-2-short-lcNiA` | 1e-2 | 1e-3 | 1,000 | 10,000 | 2.4947 | 2.4947 | 12.12 | 465.5s | Stable but too high; degraded loss |
+| `sweet_quince_8l0ndwyylm` | `cs336-transformer-tinystories-h100-basic-jSqCl` | 3e-4 | 3e-5 | 1,000 | 40,000 | 1.4004 | 1.4132 | 4.11 | 1825.8s | Stable full baseline |
+
+### Training And Validation Loss Trends
+
+These trend points come from the downloaded AML run logs. Training loss is logged
+every 50 iterations in AML; the chart below samples every 1,000 iterations to
+keep the document readable. Validation loss is logged every 500 iterations, so
+the validation chart includes every evaluation point from the completed short
+runs. The 40k basic run is also plotted over its first 10k steps as a full-budget
+reference.
+
+| Series | Chart color | Run status |
+| --- | --- | --- |
+| `1e-4` short | Red (`#dc2626`) | Completed |
+| `3e-4` short | Blue (`#2563eb`) | Completed |
+| `1e-3` short | Green (`#16a34a`) | Completed |
+| `3e-4` basic 40k | Orange (`#f97316`) | Completed |
+| `3e-3` short | Purple (`#7c3aed`) | Completed |
+| `1e-2` short | Black (`#111827`) | Completed |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#dc2626, #2563eb, #16a34a, #f97316, #7c3aed, #111827"}}}}%%
+xychart-beta
+  title "Training Loss Trend by Learning Rate"
+  x-axis [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+  y-axis "train loss" 1.4 --> 3.2
+  line [3.1505, 2.5283, 2.4294, 2.2778, 1.9943, 2.0263, 1.8672, 1.9417, 2.0304, 1.9291]
+  line [2.7182, 2.2063, 1.9876, 1.8929, 1.6796, 1.7721, 1.6725, 1.6874, 1.6221, 1.6713]
+  line [2.3845, 1.8548, 1.8706, 1.7066, 1.6576, 1.6074, 1.5072, 1.6024, 1.5458, 1.5844]
+  line [2.5855, 2.2055, 2.0472, 1.8547, 1.7198, 1.7706, 1.7382, 1.6314, 1.7023, 1.6549]
+  line [2.3418, 1.9506, 1.8050, 1.7471, 1.6290, 1.6403, 1.5844, 1.6026, 1.5418, 1.4083]
+  line [3.0389, 3.0415, 3.0099, 3.0344, 2.9284, 2.9230, 2.7689, 2.6819, 2.5241, 2.4713]
+```
+
+Series order: `1e-4` short red, `3e-4` short blue, `1e-3` short green,
+`3e-4` basic 40k orange, `3e-3` short purple, `1e-2` short black.
+
+| Iteration | Train loss 1e-4 short | Train loss 3e-4 short | Train loss 1e-3 short | Train loss 3e-4 basic | Train loss 3e-3 short | Train loss 1e-2 short |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 3.1505 | 2.7182 | 2.3845 | 2.5855 | 2.3418 | 3.0389 |
+| 2,000 | 2.5283 | 2.2063 | 1.8548 | 2.2055 | 1.9506 | 3.0415 |
+| 3,000 | 2.4294 | 1.9876 | 1.8706 | 2.0472 | 1.8050 | 3.0099 |
+| 4,000 | 2.2778 | 1.8929 | 1.7066 | 1.8547 | 1.7471 | 3.0344 |
+| 5,000 | 1.9943 | 1.6796 | 1.6576 | 1.7198 | 1.6290 | 2.9284 |
+| 6,000 | 2.0263 | 1.7721 | 1.6074 | 1.7706 | 1.6403 | 2.9230 |
+| 7,000 | 1.8672 | 1.6725 | 1.5072 | 1.7382 | 1.5844 | 2.7689 |
+| 8,000 | 1.9417 | 1.6874 | 1.6024 | 1.6314 | 1.6026 | 2.6819 |
+| 9,000 | 2.0304 | 1.6221 | 1.5458 | 1.7023 | 1.5418 | 2.5241 |
+| 10,000 | 1.9291 | 1.6713 | 1.5844 | 1.6549 | 1.4083 | 2.4713 |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#dc2626, #2563eb, #16a34a, #f97316, #7c3aed, #111827"}}}}%%
+xychart-beta
+  title "Validation Loss Trend by Learning Rate"
+  x-axis [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000, 6500, 7000, 7500, 8000, 8500, 9000, 9500, 10000]
+  y-axis "val loss" 1.4 --> 4.3
+  line [4.2007, 3.0948, 2.7124, 2.5126, 2.3927, 2.3142, 2.2506, 2.2032, 2.1398, 2.1073, 2.0540, 2.0386, 2.0014, 1.9651, 1.9617, 1.9924, 1.9420, 1.9444, 1.9431, 1.9102]
+  line [3.3341, 2.6183, 2.3053, 2.1743, 2.0509, 1.9728, 1.8819, 1.8503, 1.8332, 1.8151, 1.7403, 1.7424, 1.7045, 1.6994, 1.6807, 1.6739, 1.6632, 1.6628, 1.6377, 1.6272]
+  line [2.7654, 2.3046, 2.0870, 1.9671, 1.8829, 1.8523, 1.8035, 1.7256, 1.7038, 1.6511, 1.6525, 1.6265, 1.5942, 1.5638, 1.5548, 1.5474, 1.5291, 1.5409, 1.5192, 1.4913]
+  line [3.3044, 2.6226, 2.3177, 2.1502, 2.0305, 1.9208, 1.8894, 1.8684, 1.8210, 1.7602, 1.7618, 1.7285, 1.7339, 1.6931, 1.7050, 1.7262, 1.6756, 1.6492, 1.6736, 1.6376]
+  line [2.5214, 2.3209, 2.1264, 2.0273, 1.9239, 1.8435, 1.8078, 1.7584, 1.7399, 1.6774, 1.6683, 1.6313, 1.6335, 1.5682, 1.5446, 1.5357, 1.5320, 1.5031, 1.5083, 1.5023]
+  line [2.7691, 3.0896, 3.0458, 3.0858, 3.0177, 3.0711, 3.1098, 2.9857, 3.0523, 2.9702, 2.8787, 2.8978, 2.7804, 2.7358, 2.6607, 2.6049, 2.5769, 2.5142, 2.5093, 2.4947]
+```
+
+Series order: `1e-4` short red, `3e-4` short blue, `1e-3` short green,
+`3e-4` basic 40k orange, `3e-3` short purple, `1e-2` short black.
+
+| Iteration | Val loss 1e-4 short | Val loss 3e-4 short | Val loss 1e-3 short | Val loss 3e-4 basic | Val loss 3e-3 short | Val loss 1e-2 short |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 500 | 4.2007 | 3.3341 | 2.7654 | 3.3044 | 2.5214 | 2.7691 |
+| 1,000 | 3.0948 | 2.6183 | 2.3046 | 2.6226 | 2.3209 | 3.0896 |
+| 1,500 | 2.7124 | 2.3053 | 2.0870 | 2.3177 | 2.1264 | 3.0458 |
+| 2,000 | 2.5126 | 2.1743 | 1.9671 | 2.1502 | 2.0273 | 3.0858 |
+| 2,500 | 2.3927 | 2.0509 | 1.8829 | 2.0305 | 1.9239 | 3.0177 |
+| 3,000 | 2.3142 | 1.9728 | 1.8523 | 1.9208 | 1.8435 | 3.0711 |
+| 3,500 | 2.2506 | 1.8819 | 1.8035 | 1.8894 | 1.8078 | 3.1098 |
+| 4,000 | 2.2032 | 1.8503 | 1.7256 | 1.8684 | 1.7584 | 2.9857 |
+| 4,500 | 2.1398 | 1.8332 | 1.7038 | 1.8210 | 1.7399 | 3.0523 |
+| 5,000 | 2.1073 | 1.8151 | 1.6511 | 1.7602 | 1.6774 | 2.9702 |
+| 5,500 | 2.0540 | 1.7403 | 1.6525 | 1.7618 | 1.6683 | 2.8787 |
+| 6,000 | 2.0386 | 1.7424 | 1.6265 | 1.7285 | 1.6313 | 2.8978 |
+| 6,500 | 2.0014 | 1.7045 | 1.5942 | 1.7339 | 1.6335 | 2.7804 |
+| 7,000 | 1.9651 | 1.6994 | 1.5638 | 1.6931 | 1.5682 | 2.7358 |
+| 7,500 | 1.9617 | 1.6807 | 1.5548 | 1.7050 | 1.5446 | 2.6607 |
+| 8,000 | 1.9924 | 1.6739 | 1.5474 | 1.7262 | 1.5357 | 2.6049 |
+| 8,500 | 1.9420 | 1.6632 | 1.5291 | 1.6756 | 1.5320 | 2.5769 |
+| 9,000 | 1.9444 | 1.6628 | 1.5409 | 1.6492 | 1.5031 | 2.5142 |
+| 9,500 | 1.9431 | 1.6377 | 1.5192 | 1.6736 | 1.5083 | 2.5093 |
+| 10,000 | 1.9102 | 1.6272 | 1.4913 | 1.6376 | 1.5023 | 2.4947 |
+
+### Validation Loss Chart
+
+Lower is better. For the completed 10k-step screening runs, increasing the
+learning rate from `1e-4` to `1e-3` improved both best and final validation loss.
+The `3e-3` probe stayed stable but did not beat `1e-3` on best validation loss.
+At `1e-2`, validation loss degraded sharply, which suggests the useful LR range
+has already been exceeded even though the run did not produce NaNs.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #dc2626"}}}}%%
+xychart-beta
+    title "Completed LR Screen: Validation Loss"
+    x-axis ["1e-4", "3e-4", "1e-3", "3e-3", "1e-2"]
+    y-axis "loss" 1.4 --> 2.0
+    bar [1.9102, 1.6272, 1.4913, 1.5023, 2.4947]
+    line [1.9257, 1.6709, 1.5021, 1.5023, 2.4947]
+```
+
+### Final Perplexity Chart
+
+Perplexity tracks the same ranking as validation loss for the completed short
+screening runs: `1e-3` was best by validation loss, `3e-3` finished with nearly
+identical perplexity but a slightly worse best validation loss, and `1e-2`
+degraded badly.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#16a34a"}}}}%%
+xychart-beta
+    title "Completed LR Screen: Final Validation Perplexity"
+    x-axis ["1e-4", "3e-4", "1e-3", "3e-3", "1e-2"]
+    y-axis "ppl" 4 --> 13
+    bar [6.86, 5.32, 4.49, 4.49, 12.12]
+```
+
+### Full-Budget Reference
+
+The 40k-step baseline used `max_lr=3e-4`, so it is not directly comparable to the
+10k-step screens by final loss alone. It shows how much additional training helps
+at a stable LR.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#f97316, #374151"}}}}%%
+xychart-beta
+  title "Basic 40k Run: Train and Validation Loss"
+  x-axis [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+  y-axis "loss" 1.3 --> 1.8
+  line [1.7198, 1.6549, 1.5685, 1.5544, 1.5353, 1.4330, 1.3534, 1.3828]
+  line [1.7602, 1.6376, 1.5531, 1.4900, 1.4731, 1.4231, 1.4172, 1.4173]
+```
+
+Series order: train loss orange, validation loss gray.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#7c3aed"}}}}%%
+xychart-beta
+    title "10k Screens vs. 40k Baseline: Best Validation Loss"
+    x-axis ["1e-4 10k", "3e-4 10k", "1e-3 10k", "3e-3 10k", "1e-2 10k", "3e-4 40k"]
+    y-axis "best val loss" 1.3 --> 2.6
+    bar [1.9102, 1.6272, 1.4913, 1.5023, 2.4947, 1.4004]
+```
+
+### Interpretation
+
+- `1e-4` was stable but too conservative for the short budget. It ended at
+  validation loss `1.9257`, far behind the other runs.
+- `3e-4` was stable and substantially better, ending at `1.6709` in 10k steps.
+- `1e-3` was the best short-run setting, reaching best validation loss `1.4913`
+  and final validation loss `1.5021` without NaN/Inf or obvious loss explosion.
+- `3e-3` was also stable, ending at validation loss `1.5023` and perplexity
+  `4.49`. It trained more aggressively but did not improve over `1e-3`.
+- `1e-2` did not numerically diverge, but it clearly exceeded the useful LR
+  range: best/final validation loss was only `2.4947`, with final perplexity
+  `12.12`.
+- The 40k `3e-4` baseline reached best validation loss `1.4004`, showing that
+  longer training at a stable LR still improves beyond the 10k screens.
+- We still have not seen NaN-style divergence, but `1e-2` is functionally too
+  large for quality. A stricter divergence probe would need an even larger LR,
+  such as `3e-2`, if the assignment specifically requires loss explosion.
+
+### Batch Size Experiments
+
+The batch-size runs keep the total token budget approximately fixed at
+`327,680,000` tokens by reducing `max_iters` as batch size increases. All three
+runs use the same `max_lr=3e-4`, `min_lr=3e-5`, `context_length=256`, and model
+shape. This makes the comparison mostly about optimizer-step count and hardware
+throughput rather than total data seen.
+
+| Run ID | Display name | Batch size | Max LR | Max iters | Tokens | Best val loss | Final val loss | Final val ppl | Runtime | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `sweet_quince_8l0ndwyylm` | `cs336-transformer-tinystories-h100-basic-jSqCl` | 32 | 3e-4 | 40,000 | 327,680,000 | 1.4004 | 1.4132 | 4.11 | 1825.8s | Original baseline. |
+| `helpful_prune_8z4yxx70r8` | `cs336-bs-64-pVlMr` | 64 | 3e-4 | 20,000 | 327,680,000 | 1.4337 | 1.4442 | 4.24 | 1706.1s | Same LR as baseline; small quality drop. |
+| `bold_vulture_1btmdqq51c` | `cs336-bs-128-Exiao` | 128 | 3e-4 | 10,000 | 327,680,000 | 1.4891 | 1.4891 | 4.43 | 1616.0s | Same LR as baseline; largest quality drop. |
+| `keen_machine_r8h2z3s4jm` | `cs336-bs-64-lr-scaled-yBKBL` | 64 | 6e-4 | 20,000 | 327,680,000 | 1.3755 | 1.3755 | 3.96 | 1708.3s | Linear LR scaling; best final loss. |
+| `loving_leg_8qkg5smb8w` | `cs336-bs-128-lr-scaled-5lavL` | 128 | 1.2e-3 | 10,000 | 327,680,000 | 1.3510 | 1.3634 | 3.91 | 1607.2s | Linear LR scaling; best validation loss. |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #f97316"}}}}%%
+xychart-beta
+  title "Batch Size Sweep: Best and Final Validation Loss"
+  x-axis ["bs32", "bs64", "bs128", "bs64 scaled", "bs128 scaled"]
+  y-axis "val loss" 1.35 --> 1.50
+  bar [1.4004, 1.4337, 1.4891, 1.3755, 1.3510]
+  line [1.4132, 1.4442, 1.4891, 1.3755, 1.3634]
+```
+
+Series order: best validation loss blue, final validation loss orange.
+
+The next chart compares validation loss at equal fractions of the total token
+budget. Because each run processes the same number of tokens overall, `25%`,
+`50%`, `75%`, and `100%` correspond to different iteration counts for each batch
+size.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #16a34a, #7c3aed, #f97316, #374151"}}}}%%
+xychart-beta
+  title "Validation Loss vs. Token Budget Fraction"
+  x-axis ["25%", "50%", "75%", "100%"]
+  y-axis "val loss" 1.4 --> 1.8
+  line [1.6376, 1.4900, 1.4231, 1.4173]
+  line [1.6805, 1.5355, 1.4529, 1.4442]
+  line [1.7559, 1.5960, 1.5272, 1.4891]
+  line [1.6004, 1.4916, 1.4167, 1.3755]
+  line [1.6094, 1.4680, 1.3922, 1.3634]
+```
+
+Series order: batch 32 blue, batch 64 green, batch 128 purple, batch 64 scaled
+orange, batch 128 scaled gray.
+
+| Token budget fraction | bs32 val loss | bs64 val loss | bs128 val loss | bs64 scaled val loss | bs128 scaled val loss |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 25% | 1.6376 | 1.6805 | 1.7559 | 1.6004 | 1.6094 |
+| 50% | 1.4900 | 1.5355 | 1.5960 | 1.4916 | 1.4680 |
+| 75% | 1.4231 | 1.4529 | 1.5272 | 1.4167 | 1.3922 |
+| 100% | 1.4173 | 1.4442 | 1.4891 | 1.3755 | 1.3634 |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #16a34a, #7c3aed, #f97316, #374151"}}}}%%
+xychart-beta
+  title "Training Loss vs. Token Budget Fraction"
+  x-axis ["25%", "50%", "75%", "100%"]
+  y-axis "train loss" 1.3 --> 1.8
+  line [1.6549, 1.5544, 1.4330, 1.3828]
+  line [1.7231, 1.5010, 1.4259, 1.3733]
+  line [1.7990, 1.6072, 1.4963, 1.5003]
+  line [1.6408, 1.4585, 1.3647, 1.3730]
+  line [1.5830, 1.4302, 1.4293, 1.3760]
+```
+
+Series order: batch 32 blue, batch 64 green, batch 128 purple, batch 64 scaled
+orange, batch 128 scaled gray.
+
+| Token budget fraction | bs32 train loss | bs64 train loss | bs128 train loss | bs64 scaled train loss | bs128 scaled train loss |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 25% | 1.6549 | 1.7231 | 1.7990 | 1.6408 | 1.5830 |
+| 50% | 1.5544 | 1.5010 | 1.6072 | 1.4585 | 1.4302 |
+| 75% | 1.4330 | 1.4259 | 1.4963 | 1.3647 | 1.4293 |
+| 100% | 1.3828 | 1.3733 | 1.5003 | 1.3730 | 1.3760 |
+
+Interpretation:
+
+- Batch size 32 gives the best validation quality for the fixed token budget,
+  likely because it gets 40k optimizer updates instead of 20k or 10k.
+- Larger batches saw the same total number of tokens, but each optimizer update
+  averaged over more examples. That reduces gradient noise, but it also means the
+  model parameters were changed fewer times across the run. In these results, the
+  lost update count mattered more than the lower-noise gradient estimate.
+- The first batch-size sweep used the same `max_lr=3e-4` schedule family for all
+  batch sizes. Large-batch training often needs LR retuning; a common first check
+  is linear LR scaling with batch size while keeping warmup measured in tokens.
+  Here that gives `max_lr=6e-4` for batch 64 and `max_lr=1.2e-3` for batch 128.
+- The LR-scaled follow-ups confirm the LR-retuning hypothesis. Batch 64 improved
+  from final validation loss `1.4442` to `1.3755`, and batch 128 improved from
+  `1.4891` to `1.3634`.
+- After LR scaling, batch size 128 gives the best validation loss and fastest
+  runtime among these fixed-token runs. Batch size 64 scaled is close behind and
+  is also better than the original batch 32 baseline.
+- For a final quality-focused run under this token budget, the best observed
+  setting is batch size 128 with `max_lr=1.2e-3`. Batch size 64 with `max_lr=6e-4`
+  is a slightly more conservative alternative.
+
+Practical summary:
+
+- Increasing batch size alone did not help, because the larger-batch runs had
+  fewer optimizer updates under the fixed token budget.
+- Increasing LR for larger batches made each update more useful and recovered
+  the lost progress; this is why linear LR scaling helped so much.
+- Increasing LR for small batches is less safe, because smaller batches have
+  noisier gradients. A modest short-run probe such as batch 32 with `max_lr=1e-3`
+  is reasonable, but jumping too high can degrade quality, as seen with `1e-2`.
+- The best current production choice from these experiments is batch 128 with
+  `max_lr=1.2e-3`; batch 64 with `max_lr=6e-4` is a safer fallback if batch 128
+  is less convenient operationally.
+
+GPU memory-limit fit probes:
+
+These probes used short 1000-step runs with `eval_every=100` and
+`ckpt_every=100` to bracket the largest batch size that fits for this model at
+`context_length=256` on the H100 instance. They are memory/throughput probes, not
+quality comparisons.
+
+| Run ID | Display name | Batch size | Status | Outcome |
+| --- | --- | ---: | --- | --- |
+| `heroic_owl_0n479k5wpp` | `cs336-bs-256-fit-eIiz8` | 256 | Completed | Fits; final val loss `2.1555`, final val ppl `8.63`. |
+| `plum_bag_nflv2nk5nh` | `cs336-bs-512-fit-hantK` | 512 | Completed | Fits; final val loss `2.1037`, final val ppl `8.20`. |
+| `elated_yuca_hrd3wytv79` | `cs336-bs-1024-fit-SHjx6` | 1024 | Failed | CUDA OOM: PyTorch had allocated `73.91 GiB` on a `79.18 GiB` H100 and failed trying to allocate another `4.00 GiB`. |
+
+Conclusion: batch size 512 is the largest tested batch size that fits. Batch
+1024 is beyond the current memory limit without memory-saving changes such as
+gradient accumulation, activation checkpointing, mixed precision, or a smaller
+model/context.
+
+Attention-memory scaling:
+
+The dominant batch-dependent memory term in standard attention is the attention
+matrix. For one layer, one fp32 attention matrix has shape
+`batch_size * num_heads * context_length * context_length`, so with
+`num_heads=16` and `context_length=256` it costs:
+
+```text
+batch_size * 16 * 256^2 * 4 bytes
+```
+
+This implementation explicitly materializes both `scores` and `weights` in
+`scaled_dot_product_attention`, so the practical per-layer attention storage is
+at least two such matrices before counting backward-pass saved tensors and
+temporary buffers.
+
+| Batch size | One attention matrix | Scores + probabilities per layer | Scores + probabilities across 4 layers | QKV activations per layer | Final logits |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 0.12 GiB | 0.25 GiB | 1.00 GiB | 0.05 GiB | 0.31 GiB |
+| 64 | 0.25 GiB | 0.50 GiB | 2.00 GiB | 0.09 GiB | 0.61 GiB |
+| 128 | 0.50 GiB | 1.00 GiB | 4.00 GiB | 0.19 GiB | 1.22 GiB |
+| 256 | 1.00 GiB | 2.00 GiB | 8.00 GiB | 0.38 GiB | 2.44 GiB |
+| 512 | 2.00 GiB | 4.00 GiB | 16.00 GiB | 0.75 GiB | 4.88 GiB |
+| 1024 | 4.00 GiB | 8.00 GiB | 32.00 GiB | 1.50 GiB | 9.77 GiB |
+
+For example, the batch-256 row is computed as follows:
+
+```text
+one attention matrix
+= batch_size * num_heads * context_length * context_length * bytes_per_value
+= 256 * 16 * 256 * 256 * 4 bytes
+= 268,435,456 fp32 values * 4 bytes
+= 1,073,741,824 bytes
+= 1.00 GiB
+
+scores + probabilities per layer
+= 1.00 GiB for scores + 1.00 GiB for softmax probabilities
+= 2.00 GiB
+
+scores + probabilities across 4 layers
+= 2.00 GiB per layer * 4 layers
+= 8.00 GiB
+```
+
+The batch-1024 failure tried to allocate another `4.00 GiB`, exactly matching
+one fp32 attention matrix at `batch_size=1024`. That is strong evidence that the
+quadratic `batch_size * num_heads * context_length^2` attention term is the
+immediate memory wall for the largest probe.
+
+Follow-up verification runs:
+
+| Run label | Batch size | Max LR | Min LR | Warmup | Max iters | Purpose |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `bs_64_lr_scaled` | 64 | 6e-4 | 6e-5 | 500 | 20,000 | Confirmed: final val loss improved to `1.3755`. |
+| `bs_128_lr_scaled` | 128 | 1.2e-3 | 1.2e-4 | 250 | 10,000 | Confirmed: final val loss improved to `1.3634`. |
+
+### Generation Evaluation
+
+Generation used the best validation-loss checkpoint from the batch-size
+experiments: `loving_leg_8qkg5smb8w`, batch size 128 with linearly scaled
+`max_lr=1.2e-3`. Samples are saved in `docs/generation_samples.md`.
+
+Prompt:
+
+```text
+Once upon a time, there was a little girl named Lily
+```
+
+| Run label | Temperature | Top-p | Seed | Qualitative result |
+| --- | ---: | ---: | ---: | --- |
+| `greedy` | 0.0 | none | 11 | Very coherent, safe, and generic; clean magic teddy-bear story ending with `<|endoftext|>`. |
+| `t0.8_p0.9` | 0.8 | 0.9 | 12 | Fluent repair-story sample; conservative and well-structured. |
+| `t1.0_p0.9` | 1.0 | 0.9 | 13 | More varied, still readable; has a small causal oddity involving a mosquito and ball. |
+| `t1.1_p0.95` | 1.1 | 0.95 | 14 | More diverse but less grounded; semantic drift around the magic pencil, ball, school, and microscope. |
+
+Interpretation:
+
+- The checkpoint clearly learned TinyStories style: simple vocabulary, short
+  sentences, child protagonist, small conflict, resolution, and explicit
+  `<|endoftext|>` stopping.
+- Lower-temperature decoding improves coherence but becomes generic. Higher
+  temperature/top-p settings add variety at the cost of consistency.
+- The best practical decoding setting from these samples is `temperature=0.8,
+  top_p=0.9` for reliable fluency. `temperature=1.0, top_p=0.9` is a reasonable
+  alternative when more variety is desired.
 
 
 

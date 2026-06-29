@@ -12,6 +12,7 @@ Lessons learned from profiling and optimizing the BPE tokenizer implementation.
 - [Rules of thumb for hot loops](#rules-of-thumb-for-hot-loops)
 - [Profiling Methodology](#profiling-methodology)
 - [PyTorch: Advanced Indexing on Tensors](#pytorch-advanced-indexing-on-tensors)
+- [PyTorch: Lazy Batch Reads from `np.memmap` and `int32` -> `long`](#pytorch-lazy-batch-reads-from-npmemmap-and-int32---long)
 - [PyTorch: Broadcasting and the `[:, None]` / `[None, :]` Outer-Product Idiom](#pytorch-broadcasting-and-the---none----none--outer-product-idiom)
 - [PyTorch: Element-wise vs Reduction Ops — What `dim` Actually Controls](#pytorch-element-wise-vs-reduction-ops--what-dim-actually-controls)
 
@@ -503,6 +504,106 @@ exist — for very large vocabularies, sparse gradient updates can be a big win.
 | Cast NumPy → index-safe tensor | `torch.from_numpy(arr).long()` |
 | Force `int64` from a Python list | `torch.tensor([1, 2, 3])` (default is `int64`) |
 | Boolean **mask** (not gather) | `E[mask]` where `mask.dtype == torch.bool` |
+
+---
+
+## PyTorch: Lazy Batch Reads from `np.memmap` and `int32` -> `long`
+
+Large token datasets should be stored on disk and read lazily. A common pattern
+is:
+
+```python
+dataset = np.memmap("training/TinyStoriesV2-GPT4-train_tokens.bin", dtype=np.int32, mode="r")
+```
+
+This does **not** load the whole token file into RAM. It creates a memory-mapped
+view of the file. The operating system only reads the pages touched by your
+code.
+
+### The trap: converting the whole memmap to Torch
+
+This looks convenient, but is bad for huge datasets:
+
+```python
+data = torch.as_tensor(dataset, dtype=torch.long)
+```
+
+If `dataset` has 540M tokens, this tries to convert all 540M tokens into a
+Torch tensor before one training step can run. It defeats the purpose of the
+memmap and can be slow or memory-heavy. It may also warn that the NumPy array is
+not writable, because read-only memmaps produce non-writable arrays.
+
+### The better pattern: sample small slices first
+
+Read only one mini-batch worth of token IDs, then convert that small batch to
+Torch:
+
+```python
+def get_batch(dataset, batch_size: int, context_length: int, device: str):
+    max_start = len(dataset) - context_length
+    starts = torch.randint(0, max_start, (batch_size,)).numpy()
+
+    x_np = np.stack([dataset[start : start + context_length] for start in starts])
+    y_np = np.stack([dataset[start + 1 : start + context_length + 1] for start in starts])
+
+    x = torch.as_tensor(x_np, dtype=torch.long, device=device)
+    y = torch.as_tensor(y_np, dtype=torch.long, device=device)
+    return x, y
+```
+
+For `batch_size=32` and `context_length=256`, this reads about:
+
+```text
+32 * (256 + 1) = 8,224 token IDs
+```
+
+instead of converting hundreds of millions of token IDs. Each training
+iteration samples one mini-batch, trains on it, discards those tensors, then the
+next iteration samples another mini-batch.
+
+### Why store as `int32` but train with `torch.long`?
+
+Token IDs only need enough range to represent the vocabulary. If
+`vocab_size=10000`, `np.int32` is plenty for disk storage:
+
+```text
+int32: 4 bytes per token
+int64: 8 bytes per token
+```
+
+For 540,796,778 tokens, that is roughly:
+
+```text
+int32 storage: 2.16 GB
+int64 storage: 4.33 GB
+```
+
+So the best split is:
+
+```python
+# Disk / memmap: compact storage.
+dataset = np.memmap(path, dtype=np.int32, mode="r")
+
+# Current batch: PyTorch-friendly index dtype.
+x = torch.as_tensor(x_np, dtype=torch.long, device=device)
+y = torch.as_tensor(y_np, dtype=torch.long, device=device)
+```
+
+`torch.long` is PyTorch's standard index dtype for embedding lookup and
+cross-entropy targets. Keeping the file as `int32` saves disk and memory; casting
+only the current batch to `long` gives PyTorch the dtype it expects without
+materializing the full dataset.
+
+### Mental model
+
+```text
+Training iteration 1: read one batch from memmap -> convert batch to long -> train
+Training iteration 2: read another batch       -> convert batch to long -> train
+Training iteration 3: read another batch       -> convert batch to long -> train
+```
+
+The full dataset stays on disk. Only the sampled slices are converted into Torch
+tensors.
 
 ---
 

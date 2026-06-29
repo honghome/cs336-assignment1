@@ -175,13 +175,12 @@ tmp/
 *.prof
 profile_output.txt
 
-# Trained tokenizer/model artifacts. Keep small experiment configs under
-# training/aml/ trackable.
+# Trained tokenizer/model artifacts.
 training/**/*.pkl
 training/**/*.bin
 training/**/*.pt
 training/*.ipynb
 !training/training.ipynb
-!training/aml/
-!training/aml/*.py
-!training/aml/*.yaml
+
+# Local Azure ML configs may contain internal subscription/workspace identifiers.
+training/aml/
