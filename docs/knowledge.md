@@ -5462,6 +5462,8 @@ reference.
 | `3e-3` short | Purple (`#7c3aed`) | Completed |
 | `1e-2` short | Black (`#111827`) | Completed |
 
+![TinyStories training loss trend by learning rate](figures/tinystories/tinystories_lr_train_loss.png)
+
 ```mermaid
 %%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#dc2626, #2563eb, #16a34a, #f97316, #7c3aed, #111827"}}}}%%
 xychart-beta
@@ -5491,6 +5493,8 @@ Series order: `1e-4` short red, `3e-4` short blue, `1e-3` short green,
 | 8,000 | 1.9417 | 1.6874 | 1.6024 | 1.6314 | 1.6026 | 2.6819 |
 | 9,000 | 2.0304 | 1.6221 | 1.5458 | 1.7023 | 1.5418 | 2.5241 |
 | 10,000 | 1.9291 | 1.6713 | 1.5844 | 1.6549 | 1.4083 | 2.4713 |
+
+![TinyStories validation loss trend by learning rate](figures/tinystories/tinystories_lr_val_loss.png)
 
 ```mermaid
 %%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#dc2626, #2563eb, #16a34a, #f97316, #7c3aed, #111827"}}}}%%
@@ -5539,6 +5543,8 @@ learning rate from `1e-4` to `1e-3` improved both best and final validation loss
 The `3e-3` probe stayed stable but did not beat `1e-3` on best validation loss.
 At `1e-2`, validation loss degraded sharply, which suggests the useful LR range
 has already been exceeded even though the run did not produce NaNs.
+
+![TinyStories LR screen best and final validation loss](figures/tinystories/tinystories_lr_screen_best_final.png)
 
 ```mermaid
 %%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #dc2626"}}}}%%
@@ -5627,6 +5633,8 @@ throughput rather than total data seen.
 | `keen_machine_r8h2z3s4jm` | `cs336-bs-64-lr-scaled-yBKBL` | 64 | 6e-4 | 20,000 | 327,680,000 | 1.3755 | 1.3755 | 3.96 | 1708.3s | Linear LR scaling; best final loss. |
 | `loving_leg_8qkg5smb8w` | `cs336-bs-128-lr-scaled-5lavL` | 128 | 1.2e-3 | 10,000 | 327,680,000 | 1.3510 | 1.3634 | 3.91 | 1607.2s | Linear LR scaling; best validation loss. |
 
+![TinyStories batch-size sweep best and final validation loss](figures/tinystories/tinystories_batch_best_final.png)
+
 ```mermaid
 %%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #f97316"}}}}%%
 xychart-beta
@@ -5643,6 +5651,8 @@ The next chart compares validation loss at equal fractions of the total token
 budget. Because each run processes the same number of tokens overall, `25%`,
 `50%`, `75%`, and `100%` correspond to different iteration counts for each batch
 size.
+
+![TinyStories validation loss versus token budget fraction](figures/tinystories/tinystories_batch_val_token_fraction.png)
 
 ```mermaid
 %%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #16a34a, #7c3aed, #f97316, #374151"}}}}%%
@@ -5666,6 +5676,8 @@ orange, batch 128 scaled gray.
 | 50% | 1.4900 | 1.5355 | 1.5960 | 1.4916 | 1.4680 |
 | 75% | 1.4231 | 1.4529 | 1.5272 | 1.4167 | 1.3922 |
 | 100% | 1.4173 | 1.4442 | 1.4891 | 1.3755 | 1.3634 |
+
+![TinyStories training loss versus token budget fraction](figures/tinystories/tinystories_batch_train_token_fraction.png)
 
 ```mermaid
 %%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #16a34a, #7c3aed, #f97316, #374151"}}}}%%
@@ -5828,6 +5840,113 @@ Interpretation:
 - The best practical decoding setting from these samples is `temperature=0.8,
   top_p=0.9` for reliable fluency. `temperature=1.0, top_p=0.9` is a reasonable
   alternative when more variety is desired.
+
+### OpenWebText Main Experiment
+
+The OpenWebText main run used the same baseline Transformer architecture and
+same `40,000` training iterations as the TinyStories baseline, but with the OWT
+tokenizer vocabulary size increased to `32,000`. The completed AML run was
+`orange_camel_9jgt9nv15m` / `cs336-owt-h100-basic-DVj5J`.
+
+A second OpenWebText run trained and evaluated natively at context length 512
+for leaderboard alignment. That completed AML run was `kind_crayon_rwxzg555zv` /
+`cs336-owt-h100-ctx512-ywQ7r`.
+
+A longer context-512 follow-up used 43,000 iterations to match the iteration
+range seen in stronger leaderboard entries. That completed AML run was
+`hungry_kitchen_73m4w3vd00` / `cs336-owt-h100-ctx512-43k-Xv3Zh`.
+
+| Setting | Value |
+| --- | ---: |
+| Dataset | OpenWebText tokenized `int32` memmap binaries |
+| Vocab size | 32,000 |
+| Context length | 256 |
+| Batch size | 32 |
+| Max iterations | 40,000 |
+| Tokens processed | 327,680,000 |
+| Max LR / min LR | 3e-4 / 3e-5 |
+| Parameters | 45,224,448 |
+| Runtime | 2454.5s / 40.91m |
+
+| Context-512 setting | Value |
+| --- | ---: |
+| Context length | 512 |
+| Batch size | 32 |
+| Max iterations | 20,000 |
+| Tokens processed | 327,680,000 |
+| Max LR / min LR | 6e-4 / 6e-5 |
+| Parameters | 45,224,448 |
+| Runtime | 2773.3s / 46.22m |
+
+| Context-512 43k setting | Value |
+| --- | ---: |
+| Context length | 512 |
+| Batch size | 32 |
+| Max iterations | 43,000 |
+| Tokens processed | 704,512,000 |
+| Max LR / min LR | 6e-4 / 6e-5 |
+| Parameters | 45,224,448 |
+| Runtime | 6005.6s / 100.09m |
+
+| Metric | Value |
+| --- | ---: |
+| First eval loss at 500 iters | 6.5961 |
+| Loss at 10k iters | 4.4374 |
+| Best validation loss | 4.0207 at 39.89m |
+| Final validation loss | 4.0239 at 40.91m |
+| Final validation perplexity | 55.92 |
+| Context-512 re-eval loss | 4.484289 |
+| Context-512 re-eval perplexity | 88.6140 |
+| Native ctx512 best under 45m | 3.9428 at 43.90m |
+| Native ctx512 best overall | 3.9320 at 45.07m |
+| Native ctx512 final loss | 3.9960 at 46.22m |
+| Native ctx512 final ppl | 54.38 |
+| Native ctx512 43k best under 45m | 3.9562 at 44.24m |
+| Native ctx512 43k best overall | 3.7865 at 90.80m |
+| Native ctx512 43k final loss | 3.7975 at 100.09m |
+| Native ctx512 43k final ppl | 44.59 |
+
+![OpenWebText context-512 validation loss versus wall-clock time](figures/owt/owt_ctx512_wallclock_learning_curve.png)
+
+![OpenWebText context-512 43k validation loss versus wall-clock time](figures/owt/owt_ctx512_43k_wallclock_learning_curve.png)
+
+This beats the assignment leaderboard's naive `5.0` validation-loss baseline
+within the stated 45-minute wall-clock window. For the leaderboard specifically,
+use the 20k native context-512 under-45-minute loss (`3.9428`), because the
+leaderboard README says reported validation loss should be calculated with
+`context_length=512` and the absolute best native ctx512 loss landed slightly
+after the 45-minute cutoff.
+
+The 43k follow-up confirms that longer context-512 training helps: it reached
+best validation loss `3.7865` and final validation loss `3.7975`. On this H100
+run, though, it needed about `100.09` training minutes, and its best loss before
+45 minutes was `3.9562`. Therefore the 43k run is a useful longer-run result,
+but the strict H100-under-45-minute submission draft still reports `3.9428` from
+the 20k context-512 run.
+
+The longer run also shows that iteration count alone does not explain the gap to
+the strongest leaderboard entries. Increasing from the 20k ctx512 run to the 43k
+ctx512 run improved best overall validation loss by about `0.15`, from roughly
+`3.94` to `3.79`, but competitive leaderboard entries are still much lower. The
+remaining gap is more likely a systems/model-efficiency gap: faster attention,
+mixed precision, `torch.compile`, better throughput, model scaling, and schedule
+retuning would let the same wall-clock budget buy more useful optimization than
+another plain baseline run.
+
+The OWT loss is much higher than TinyStories loss because the OWT distribution is
+substantially broader: web pages, news, names, dates, quotes, markup-like text,
+URLs, inconsistent formatting, and many factual topics. TinyStories is narrow
+and repetitive, so the same small Transformer can become much more confident on
+the validation distribution. The loss numbers should therefore be compared as
+within-dataset progress, not as direct evidence that one model is universally
+better than the other.
+
+OWT generations are saved in `docs/owt_generation_samples.md`. The model learned
+article-like structure and public-affairs vocabulary, but samples are less
+grounded than TinyStories generations. Greedy decoding repeats government and
+military phrases, while moderate `temperature=0.8, top_p=0.9` sampling is more
+varied and readable. Higher temperature produces citation-like clutter and more
+semantic drift.
 
 
 

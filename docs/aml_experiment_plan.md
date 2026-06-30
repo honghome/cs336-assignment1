@@ -111,6 +111,8 @@ Short-run comparison from downloaded AML logs:
 | `upbeat_lock_54rymc868v` | 1e-2 | 10,000 | 2.7691 | 2.4947 | 2.4947 | 12.12 | 465.5s | No NaNs, but far outside useful LR range. |
 | `sweet_quince_8l0ndwyylm` | 3e-4 | 40,000 | 3.3044 | 1.4004 | 1.4132 | 4.11 | 1825.8s | Stable full baseline. |
 
+![TinyStories LR screen best and final validation loss](figures/tinystories/tinystories_lr_screen_best_final.png)
+
 Interpretation: at this model size and 10k-step screening budget, higher LR
 improved early learning substantially. The 1e-4 run was stable but underfit the
 short budget; 3e-4 was much better; 1e-3 was best; 3e-3 remained stable but did
@@ -191,6 +193,12 @@ Scaled-LR follow-up comparison:
 | `keen_machine_r8h2z3s4jm` | 64 | 6e-4 | 1.3755 | 1.3755 | 3.96 | 1708.3s | Final val improved by 0.0687. |
 | `bold_vulture_1btmdqq51c` | 128 | 3e-4 | 1.4891 | 1.4891 | 4.43 | 1616.0s | Baseline bs128. |
 | `loving_leg_8qkg5smb8w` | 128 | 1.2e-3 | 1.3510 | 1.3634 | 3.91 | 1607.2s | Final val improved by 0.1257. |
+
+![TinyStories batch-size sweep best and final validation loss](figures/tinystories/tinystories_batch_best_final.png)
+
+![TinyStories validation loss versus token budget fraction](figures/tinystories/tinystories_batch_val_token_fraction.png)
+
+![TinyStories training loss versus token budget fraction](figures/tinystories/tinystories_batch_train_token_fraction.png)
 
 Interpretation: the scaled-LR follow-ups strongly support the hypothesis that
 the first large-batch runs underperformed mainly because the LR schedule was too
@@ -444,28 +452,169 @@ Report notes to write after runs:
 - Is the gap visible early, or only after longer training?
 - Does generation quality differ even when validation losses are close?
 
-## Phase 8: OpenWebText Optional/Main Experiment
+## Phase 8: OpenWebText Main Experiment
 
 Assignment question: train on OpenWebText with the same model architecture and
 total training iterations as TinyStories, then interpret the losses.
 
-Do this only after the TinyStories baseline and required ablations are stable,
-because OWT is noisier and more expensive to interpret. Use the baseline model
-unless the assignment write-up explicitly chooses a different architecture based
-on TinyStories evidence.
+Completed runs:
 
-Suggested runs:
+| Run ID | Display name | Dataset | Vocab | Batch size | Max iters | Max LR | Runtime | Best val loss | Final val loss | Final val ppl | Status |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `orange_camel_9jgt9nv15m` | `cs336-owt-h100-basic-DVj5J` | OpenWebText | 32,000 | 32 | 40,000 | 3e-4 | 2454.5s / 40.91m | 4.0207 | 4.0239 | 55.92 | Completed |
+| `kind_crayon_rwxzg555zv` | `cs336-owt-h100-ctx512-ywQ7r` | OpenWebText | 32,000 | 32 | 20,000 | 6e-4 | 2773.3s / 46.22m | 3.9320 | 3.9960 | 54.38 | Completed |
+| `hungry_kitchen_73m4w3vd00` | `cs336-owt-h100-ctx512-43k-Xv3Zh` | OpenWebText | 32,000 | 32 | 43,000 | 6e-4 | 6005.6s / 100.09m | 3.7865 | 3.7975 | 44.59 | Completed |
 
-| Run label | Dataset | Model variant | Max iters | Notes |
-| --- | --- | --- | ---: | --- |
-| `owt_baseline_short` | OpenWebText | Baseline | 10,000 | Smoke test data pipeline and loss scale. |
-| `owt_baseline_full` | OpenWebText | Baseline | 40,000 | Main OWT comparison. |
+All OWT runs used the TinyStories baseline architecture, with the vocabulary
+size changed to 32,000 for the OWT tokenizer. The first run trained/evaluated at
+context length 256. The second run trained/evaluated natively at context length
+512 for leaderboard alignment with the same token count as the context-256 run:
 
-Report notes to write after runs:
+```text
+32 * 40,000 * 256 = 32 * 20,000 * 512 = 327,680,000 tokens
+```
 
-- OWT validation loss is not directly comparable to TinyStories loss because the data distribution is broader and noisier.
-- Discuss whether samples are more diverse but less story-like.
-- Note any tokenizer/data differences that affect interpretation.
+The 43k context-512 follow-up was a longer leaderboard-style iteration-count
+probe. It processed `704,512,000` tokens and improved the best overall loss, but
+it took about `100.09` H100 minutes, so it is not a strict 45-minute H100 result.
+
+Learning curve points from the downloaded AML log:
+
+Context-256 run:
+
+![OpenWebText context-256 validation loss versus wall-clock time](figures/owt/owt_wallclock_learning_curve.png)
+
+| Iteration | Wall-clock minutes | Val loss | Val ppl |
+| ---: | ---: | ---: | ---: |
+| 5,000 | 5.10 | 4.7711 | 118.04 |
+| 10,000 | 10.23 | 4.4374 | 84.55 |
+| 15,000 | 15.35 | 4.3330 | 76.17 |
+| 20,000 | 20.47 | 4.1829 | 65.56 |
+| 25,000 | 25.59 | 4.1194 | 61.52 |
+| 30,000 | 30.69 | 4.0955 | 60.07 |
+| 35,000 | 35.79 | 4.0453 | 57.13 |
+| 39,000 | 39.89 | 4.0207 | 55.74 |
+| 40,000 | 40.91 | 4.0239 | 55.92 |
+
+```mermaid
+xychart-beta
+  title "OpenWebText Validation Loss vs. Wall-Clock Time"
+  x-axis "minutes" [5.10, 10.23, 15.35, 20.47, 25.59, 30.69, 35.79, 39.89, 40.91]
+  y-axis "val loss" 4.0 --> 4.8
+  line [4.7711, 4.4374, 4.3330, 4.1829, 4.1194, 4.0955, 4.0453, 4.0207, 4.0239]
+```
+
+Context-512 run:
+
+![OpenWebText context-512 validation loss versus wall-clock time](figures/owt/owt_ctx512_wallclock_learning_curve.png)
+
+| Iteration | Wall-clock minutes | Val loss | Val ppl |
+| ---: | ---: | ---: | ---: |
+| 2,500 | 5.76 | 4.7418 | 114.64 |
+| 5,000 | 11.54 | 4.3947 | 81.02 |
+| 7,500 | 17.32 | 4.2334 | 68.95 |
+| 10,000 | 23.09 | 4.1584 | 63.97 |
+| 12,500 | 28.87 | 4.0795 | 59.11 |
+| 15,000 | 34.64 | 4.0101 | 55.15 |
+| 17,500 | 40.44 | 3.9985 | 54.52 |
+| 19,000 | 43.90 | 3.9428 | 51.56 |
+| 19,500 | 45.07 | 3.9320 | 51.01 |
+| 20,000 | 46.22 | 3.9960 | 54.38 |
+
+```mermaid
+xychart-beta
+  title "OpenWebText Context-512 Validation Loss vs. Wall-Clock Time"
+  x-axis "minutes" [5.76, 11.54, 17.32, 23.09, 28.87, 34.64, 40.44, 43.90, 45.07, 46.22]
+  y-axis "val loss" 3.9 --> 4.8
+  line [4.7418, 4.3947, 4.2334, 4.1584, 4.0795, 4.0101, 3.9985, 3.9428, 3.9320, 3.9960]
+```
+
+Context-512 43k follow-up:
+
+![OpenWebText context-512 43k validation loss versus wall-clock time](figures/owt/owt_ctx512_43k_wallclock_learning_curve.png)
+
+The first attempt was interrupted after 4,900 iterations and retried by AML. The
+table below uses the completed `retry_001` training attempt.
+
+| Iteration | Wall-clock minutes | Val loss | Val ppl |
+| ---: | ---: | ---: | ---: |
+| 5,000 | 11.62 | 4.4029 | 81.69 |
+| 10,000 | 23.28 | 4.1532 | 63.64 |
+| 15,000 | 34.92 | 4.0590 | 57.92 |
+| 19,000 | 44.24 | 3.9562 | 52.26 |
+| 19,500 | 45.41 | 3.9748 | 53.24 |
+| 20,000 | 46.57 | 3.9782 | 53.42 |
+| 25,000 | 58.20 | 3.9360 | 51.22 |
+| 30,000 | 69.83 | 3.8620 | 47.56 |
+| 35,000 | 81.48 | 3.8276 | 45.95 |
+| 39,000 | 90.80 | 3.7865 | 44.10 |
+| 40,000 | 93.12 | 3.8098 | 45.14 |
+| 43,000 | 100.09 | 3.8100 | 45.15 |
+
+```mermaid
+xychart-beta
+  title "OpenWebText Context-512 43k Validation Loss vs. Wall-Clock Time"
+  x-axis "minutes" [11.62, 23.28, 34.92, 44.24, 45.41, 46.57, 58.20, 69.83, 81.48, 90.80, 93.12, 100.09]
+  y-axis "val loss" 3.75 --> 4.45
+  line [4.4029, 4.1532, 4.0590, 3.9562, 3.9748, 3.9782, 3.9360, 3.8620, 3.8276, 3.7865, 3.8098, 3.8100]
+```
+
+Comparison to TinyStories:
+
+| Dataset/run | Vocab | Best val loss | Final val loss | Final val ppl | Runtime | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| TinyStories baseline `sweet_quince_8l0ndwyylm` | 10,000 | 1.4004 | 1.4132 | 4.11 | 1825.8s | Simple, narrow story distribution. |
+| TinyStories best scaled-batch `loving_leg_8qkg5smb8w` | 10,000 | 1.3510 | 1.3634 | 3.91 | 1607.2s | Best TinyStories validation result so far. |
+| OpenWebText `orange_camel_9jgt9nv15m` | 32,000 | 4.0207 | 4.0239 | 55.92 | 2454.5s | Much broader web-text distribution. |
+| OpenWebText ctx512 `kind_crayon_rwxzg555zv` | 32,000 | 3.9320 | 3.9960 | 54.38 | 2773.3s | Native context-512 run; best under 45m was 3.9428. |
+| OpenWebText ctx512 43k `hungry_kitchen_73m4w3vd00` | 32,000 | 3.7865 | 3.7975 | 44.59 | 6005.6s | Longer H100 run; best under 45m was 3.9562. |
+
+The OWT validation loss is much higher than TinyStories, but this does not mean
+the training failed. OpenWebText contains broader topics, names, dates, URLs,
+quotations, news prose, code-like fragments, and inconsistent formatting. The
+same 45M-parameter model and 327.7M-token training budget are therefore spread
+over a much harder distribution. TinyStories is narrow, repetitive, and designed
+for simple story language, so the model can assign much sharper probabilities
+after the same number of tokens.
+
+OWT samples are saved in `docs/owt_generation_samples.md`. Qualitatively, the
+model learned web/news style and can produce article-like paragraphs, but it is
+less grounded than the TinyStories model. Greedy decoding loops on repeated
+government/military phrases. Moderate nucleus sampling is more diverse and more
+article-like, while high temperature produces citation-like clutter and factual
+nonsense.
+
+## Leaderboard Budget Note
+
+The leaderboard rule asks for a run under `0.75` B200-hours, which the handout
+equates to a learning curve with a wall-clock x-axis below 45 minutes. The
+leaderboard README also says reported validation loss should be calculated with
+`context_length=512`.
+
+The 20k native context-512 run remains the strict H100-under-45-minute
+leaderboard candidate. Its best validation loss before the 45-minute cutoff was
+`3.9428` at `43.90` minutes. The absolute best logged loss was `3.9320`, but it
+occurred at `45.07` minutes, just past the cutoff, so the budget-compliant
+leaderboard number should be `3.9428`.
+
+The 43k follow-up reached a better overall loss, `3.7865` at `90.80` minutes,
+and finished at final validation loss `3.7975`. However, on this H100 run its
+best validation loss before 45 minutes was `3.9562`, which is worse than the 20k
+run's `3.9428`. The 43k result is useful evidence for what a faster B200-style
+budget may support, but it should not replace the strict H100-under-45-minute
+reported number unless rerun or validated under the target B200 budget.
+
+This beats both the naive `5.0` baseline and the previous context-256 checkpoint
+re-evaluation loss (`4.484289`). For the leaderboard PR, disclose the hardware,
+wall-clock time, model size, context length `512`, and that the run used
+`max_lr=6e-4`, `min_lr=6e-5`, and 20,000 iterations.
+
+Artifacts prepared for submission:
+
+- Context-256 learning curve image: `docs/figures/owt/owt_wallclock_learning_curve.png`
+- Context-512 learning curve image: `docs/figures/owt/owt_ctx512_wallclock_learning_curve.png`
+- Context-512 43k learning curve image: `docs/figures/owt/owt_ctx512_43k_wallclock_learning_curve.png`
+- Draft PR/table text: `docs/leaderboard_submission_draft.md`
 
 ## AML Submission Workflow
 
